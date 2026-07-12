@@ -1,6 +1,6 @@
 require('dotenv').config();
 const dns = require('dns');
-   dns.setServers(['8.8.8.8', '1.1.1.1']);
+dns.setServers(['8.8.8.8', '1.1.1.1']);
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -8,9 +8,29 @@ const PlaySession = require('./models/PlaySession');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
-app.use(cors({ origin: ALLOWED_ORIGIN }));
+// Comma-separated list, e.g.:
+//   ALLOWED_ORIGINS=https://k1weekly.netlify.app,http://localhost:5173
+// Falls back to the old single-origin var name for compatibility, then to '*'.
+const rawOrigins = process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || '*';
+const allowedOrigins = rawOrigins
+  .split(',')
+  .map((o) => o.trim().replace(/\/$/, '')) // strip any trailing slash — Origin headers never have one
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // No Origin header (curl, server-to-server, health checks) — allow it.
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes('*') || allowedOrigins.includes(origin.replace(/\/$/, ''))) {
+        return callback(null, true);
+      }
+      console.warn(`CORS blocked origin: ${origin}`);
+      return callback(new Error('Not allowed by CORS'));
+    },
+  })
+);
 app.use(express.json());
 
 // Add every game slug you ship so bad/typo'd data can't sneak into the DB.
@@ -71,6 +91,44 @@ app.get('/api/stats', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not load stats' });
+  }
+});
+
+// One row per player+game — times played, best/last score, best streak.
+app.get('/api/summary', async (req, res) => {
+  try {
+    const summary = await PlaySession.aggregate([
+      { $sort: { completedAt: 1 } },
+      {
+        $group: {
+          _id: { playerName: '$playerName', game: '$game' },
+          timesPlayed: { $sum: 1 },
+          bestStars: { $max: '$stars' },
+          lastStars: { $last: '$stars' },
+          totalRounds: { $last: '$totalRounds' },
+          bestStreak: { $max: '$peakStreak' },
+          lastPlayedAt: { $max: '$completedAt' },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          playerName: '$_id.playerName',
+          game: '$_id.game',
+          timesPlayed: 1,
+          bestStars: 1,
+          lastStars: 1,
+          totalRounds: 1,
+          bestStreak: 1,
+          lastPlayedAt: 1,
+        },
+      },
+      { $sort: { playerName: 1, game: 1 } },
+    ]);
+    res.json(summary);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load summary' });
   }
 });
 
