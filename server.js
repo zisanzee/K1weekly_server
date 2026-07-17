@@ -160,6 +160,22 @@ app.get('/api/summary', async (req, res) => {
   }
 });
 
+// Every individual play session, uncollapsed — used by the "show all plays"
+// view in the teacher dashboard (the summary above already groups repeat
+// plays by player+game, so this is the only place to see each play on its
+// own row). Most recent first.
+app.get('/api/plays', async (req, res) => {
+  try {
+    const plays = await PlaySession.find({})
+      .sort({ completedAt: -1 })
+      .select('playerName game stars totalRounds peakStreak completedAt -_id');
+    res.json(plays);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load play sessions' });
+  }
+});
+
 // Top 10 runs for a single game, best score first.
 app.get('/api/leaderboard/:game', async (req, res) => {
   try {
