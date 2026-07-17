@@ -45,7 +45,7 @@ app.get('/api/health', (req, res) => {
 // Log one completed play session.
 app.post('/api/plays', async (req, res) => {
   try {
-    const { game, playerName, stars, totalRounds, peakStreak } = req.body;
+    const { game, playerName, stars, totalRounds, peakStreak, device } = req.body;
 
     if (!KNOWN_GAMES.includes(game)) {
       return res.status(400).json({ error: `game must be one of: ${KNOWN_GAMES.join(', ')}` });
@@ -54,12 +54,26 @@ app.post('/api/plays', async (req, res) => {
     const safeTotalRounds = Number(totalRounds) || 0;
     const safeStars = Math.max(0, Math.min(Number(stars) || 0, safeTotalRounds || 999));
 
+    // Trust nothing from the client beyond a coarse, bounded shape — this is
+    // for "what device is this lagging on" diagnostics, not anything strict.
+    const KNOWN_DEVICE_KINDS = ['mobile', 'tablet', 'desktop', 'unknown'];
+    const safeDevice =
+      device && typeof device === 'object'
+        ? {
+            kind: KNOWN_DEVICE_KINDS.includes(device.kind) ? device.kind : 'unknown',
+            os: (device.os || 'Unknown OS').toString().slice(0, 40),
+            browser: (device.browser || 'Unknown browser').toString().slice(0, 40),
+            userAgent: (device.userAgent || '').toString().slice(0, 300),
+          }
+        : undefined;
+
     const session = await PlaySession.create({
       game,
       playerName: (playerName || 'Guest').toString().slice(0, 40),
       stars: safeStars,
       totalRounds: safeTotalRounds,
       peakStreak: Math.max(0, Number(peakStreak) || 0),
+      device: safeDevice,
     });
 
     res.status(201).json({ ok: true, id: session._id });
@@ -168,7 +182,7 @@ app.get('/api/plays', async (req, res) => {
   try {
     const plays = await PlaySession.find({})
       .sort({ completedAt: -1 })
-      .select('playerName game stars totalRounds peakStreak completedAt -_id');
+      .select('playerName game stars totalRounds peakStreak completedAt device -_id');
     res.json(plays);
   } catch (err) {
     console.error(err);

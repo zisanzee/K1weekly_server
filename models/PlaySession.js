@@ -7,6 +7,17 @@ const playSessionSchema = new mongoose.Schema({
   totalRounds: { type: Number, required: true },
   peakStreak: { type: Number, default: 0 },
   completedAt: { type: Date, default: Date.now },
+  // Coarse device info captured client-side at the end of a play session —
+  // handy for spotting "this game lags on X" patterns in the classroom.
+  // Note: the inner classification field is called `kind`, not `type` —
+  // Mongoose reads a nested `type` key as a type-declaration shorthand,
+  // which would break this subdocument.
+  device: {
+    kind: { type: String, enum: ['mobile', 'tablet', 'desktop', 'unknown'], default: 'unknown' },
+    os: { type: String, default: 'Unknown OS' },
+    browser: { type: String, default: 'Unknown browser' },
+    userAgent: { type: String },
+  },
 });
 
 module.exports = mongoose.model('PlaySession', playSessionSchema);
