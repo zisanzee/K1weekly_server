@@ -34,7 +34,7 @@ app.use(
 app.use(express.json());
 
 // Add every game slug you ship so bad/typo'd data can't sneak into the DB.
-const KNOWN_GAMES = ['game1', 'game2', 'game3', 'game4'];
+const KNOWN_GAMES = ['game1', 'game2', 'game3', 'game4', 'game5'];
 
 // Hit this after deploying to confirm the server + database are both alive.
 // dbState: 0 = disconnected, 1 = connected, 2 = connecting, 3 = disconnecting
