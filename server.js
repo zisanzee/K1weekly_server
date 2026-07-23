@@ -49,7 +49,7 @@ app.get('/api/health', (req, res) => {
 // Log one completed play session.
 app.post('/api/plays', async (req, res) => {
   try {
-    const { game, playerName, stars, totalRounds, peakStreak, device } = req.body;
+    const { game, playerName, stars, totalRounds, peakStreak, elapsedSeconds, mistakes, device } = req.body;
 
     if (!KNOWN_GAMES.includes(game)) {
       return res.status(400).json({ error: `game must be one of: ${KNOWN_GAMES.join(', ')}` });
@@ -57,6 +57,11 @@ app.post('/api/plays', async (req, res) => {
 
     const safeTotalRounds = Number(totalRounds) || 0;
     const safeStars = Math.max(0, Math.min(Number(stars) || 0, safeTotalRounds || 999));
+    // Only set when the caller actually sent a value — round/star-based
+    // games never send this, and there's no sensible zero-default for it.
+    const safeElapsedSeconds =
+      elapsedSeconds === undefined || elapsedSeconds === null ? undefined : Math.max(0, Number(elapsedSeconds) || 0);
+    const safeMistakes = Math.max(0, Number(mistakes) || 0);
 
     // Trust nothing from the client beyond a coarse, bounded shape — this is
     // for "what device is this lagging on" diagnostics, not anything strict.
@@ -77,6 +82,8 @@ app.post('/api/plays', async (req, res) => {
       stars: safeStars,
       totalRounds: safeTotalRounds,
       peakStreak: Math.max(0, Number(peakStreak) || 0),
+      elapsedSeconds: safeElapsedSeconds,
+      mistakes: safeMistakes,
       device: safeDevice,
     });
 
@@ -186,7 +193,7 @@ app.get('/api/plays', async (req, res) => {
   try {
     const plays = await PlaySession.find({})
       .sort({ completedAt: -1 })
-      .select('playerName game stars totalRounds peakStreak completedAt device -_id');
+      .select('playerName game stars totalRounds peakStreak elapsedSeconds mistakes completedAt device -_id');
     res.json(plays);
   } catch (err) {
     console.error(err);
@@ -217,5 +224,3 @@ mongoose
     console.error('MongoDB connection failed:', err.message);
     process.exit(1);
   });
-
-

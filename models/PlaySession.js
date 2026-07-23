@@ -6,6 +6,10 @@ const playSessionSchema = new mongoose.Schema({
   stars: { type: Number, required: true },
   totalRounds: { type: Number, required: true },
   peakStreak: { type: Number, default: 0 },
+  // Only populated by time-trial style games (e.g. the bonus Phaser games)
+  // that don't naturally fit the round/star scoring the numbered games use.
+  elapsedSeconds: { type: Number },
+  mistakes: { type: Number, default: 0 },
   completedAt: { type: Date, default: Date.now },
   // Coarse device info captured client-side at the end of a play session —
   // handy for spotting "this game lags on X" patterns in the classroom.
