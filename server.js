@@ -5,8 +5,14 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const PlaySession = require('./models/PlaySession');
+const GameAccess = require('./models/GameAccess');
+const { lookupTeacher } = require('./teacherCodes');
 
 const app = express();
+
+// Canonical list of homepage game keys — must match GAME_KEYS in the
+// frontend's gameAccess.js. Add a new game to both places when you ship one.
+const GAME_KEYS = ['1', '2', '3', '4', '5', '6', 'b1'];
 const PORT = process.env.PORT || 4000;
 
 // Comma-separated list, e.g.:
@@ -44,6 +50,65 @@ const KNOWN_GAMES = ['game1', 'game2', 'game3', 'game4',
 // dbState: 0 = disconnected, 1 = connected, 2 = connecting, 3 = disconnecting
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, dbState: mongoose.connection.readyState });
+});
+
+// Which games are unlocked for players right now — public, no teacher code
+// needed. The homepage and the direct-URL gate both call this on load.
+// Any game key that doesn't have a document yet defaults to locked, so a
+// brand new game is "coming soon" until a teacher explicitly flips it on.
+app.get('/api/game-access', async (req, res) => {
+  try {
+    const docs = await GameAccess.find({ gameKey: { $in: GAME_KEYS } });
+    const byKey = new Map(docs.map((d) => [d.gameKey, d]));
+
+    const rows = GAME_KEYS.map((gameKey) => {
+      const doc = byKey.get(gameKey);
+      return {
+        gameKey,
+        unlocked: doc ? doc.unlocked : false,
+        updatedBy: doc ? doc.updatedBy : null,
+        updatedAt: doc ? doc.updatedAt : null,
+      };
+    });
+
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load game access' });
+  }
+});
+
+// Lock/unlock one game. Requires a valid teacher code in the body — this
+// is the actual security boundary, not the frontend's isTeacher flag.
+app.put('/api/game-access/:gameKey', async (req, res) => {
+  try {
+    const { gameKey } = req.params;
+    const { unlocked, teacherCode } = req.body;
+
+    const teacherName = lookupTeacher(teacherCode);
+    if (!teacherName) {
+      return res.status(401).json({ error: 'Invalid or missing teacher code' });
+    }
+
+    if (!GAME_KEYS.includes(gameKey)) {
+      return res.status(400).json({ error: `gameKey must be one of: ${GAME_KEYS.join(', ')}` });
+    }
+
+    if (typeof unlocked !== 'boolean') {
+      return res.status(400).json({ error: 'unlocked must be true or false' });
+    }
+
+    const doc = await GameAccess.findOneAndUpdate(
+      { gameKey },
+      { unlocked, updatedBy: teacherName, updatedAt: new Date() },
+      { upsert: true, new: true }
+    );
+
+    res.json({ ok: true, gameKey: doc.gameKey, unlocked: doc.unlocked, updatedBy: doc.updatedBy });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not update game access' });
+  }
 });
 
 // Log one completed play session.
