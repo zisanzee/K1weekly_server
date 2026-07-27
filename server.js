@@ -84,58 +84,6 @@ app.get('/api/game-access', async (req, res) => {
     res.status(500).json({ error: 'Could not load game access' });
   }
 });
-
-// Lock or unlock one game.
-app.put('/api/game-access/:gameKey', async (req, res) => {
-  try {
-    const { gameKey } = req.params;
-    const { unlocked, teacherCode } = req.body;
-
-    const teacherName = lookupTeacher(teacherCode);
-    if (!teacherName) {
-      return res.status(401).json({ error: 'Invalid or missing teacher code' });
-    }
-
-    if (!GAME_KEYS.includes(gameKey)) {
-      return res.status(400).json({ error: `gameKey must be one of: ${GAME_KEYS.join(', ')}` });
-    }
-
-    if (typeof unlocked !== 'boolean') {
-      return res.status(400).json({ error: 'unlocked must be true or false' });
-    }
-
-    const existing = await GameAccess.findOne({ gameKey }).select('order');
-    const defaultOrder = GAME_KEYS.indexOf(gameKey);
-
-    const doc = await GameAccess.findOneAndUpdate(
-      { gameKey },
-      {
-        $set: {
-          unlocked,
-          updatedBy: teacherName,
-          updatedAt: new Date(),
-        },
-        $setOnInsert: {
-          order: defaultOrder,
-        },
-      },
-      { upsert: true, new: true }
-    );
-
-    res.json({
-      ok: true,
-      gameKey: doc.gameKey,
-      unlocked: doc.unlocked,
-      order: Number.isInteger(existing?.order) ? existing.order : doc.order,
-      updatedBy: doc.updatedBy,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Could not update game access' });
-  }
-});
-
-// Teacher-only: save the complete game order after a drag-and-drop action.
 app.put('/api/game-access/order', async (req, res) => {
   try {
     const { gameKeys, teacherCode } = req.body;
@@ -187,6 +135,58 @@ app.put('/api/game-access/order', async (req, res) => {
     res.status(500).json({ error: 'Could not save game order' });
   }
 });
+// Lock or unlock one game.
+app.put('/api/game-access/:gameKey', async (req, res) => {
+  try {
+    const { gameKey } = req.params;
+    const { unlocked, teacherCode } = req.body;
+
+    const teacherName = lookupTeacher(teacherCode);
+    if (!teacherName) {
+      return res.status(401).json({ error: 'Invalid or missing teacher code' });
+    }
+
+    if (!GAME_KEYS.includes(gameKey)) {
+      return res.status(400).json({ error: `gameKey must be one of: ${GAME_KEYS.join(', ')}` });
+    }
+
+    if (typeof unlocked !== 'boolean') {
+      return res.status(400).json({ error: 'unlocked must be true or false' });
+    }
+
+    const existing = await GameAccess.findOne({ gameKey }).select('order');
+    const defaultOrder = GAME_KEYS.indexOf(gameKey);
+
+    const doc = await GameAccess.findOneAndUpdate(
+      { gameKey },
+      {
+        $set: {
+          unlocked,
+          updatedBy: teacherName,
+          updatedAt: new Date(),
+        },
+        $setOnInsert: {
+          order: defaultOrder,
+        },
+      },
+      { upsert: true, new: true }
+    );
+
+    res.json({
+      ok: true,
+      gameKey: doc.gameKey,
+      unlocked: doc.unlocked,
+      order: Number.isInteger(existing?.order) ? existing.order : doc.order,
+      updatedBy: doc.updatedBy,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not update game access' });
+  }
+});
+
+// Teacher-only: save the complete game order after a drag-and-drop action.
+
 
 // Lock/unlock one game. Requires a valid teacher code in the body — this
 // is the actual security boundary, not the frontend's isTeacher flag.
