@@ -56,25 +56,135 @@ app.get('/api/health', (req, res) => {
 // needed. The homepage and the direct-URL gate both call this on load.
 // Any game key that doesn't have a document yet defaults to locked, so a
 // brand new game is "coming soon" until a teacher explicitly flips it on.
+// Returns every game in its saved display order. Older documents without an
+// `order` value automatically use the original GAME_KEYS order.
+async function getGameAccessRows() {
+  const docs = await GameAccess.find({ gameKey: { $in: GAME_KEYS } });
+  const byKey = new Map(docs.map((doc) => [doc.gameKey, doc]));
+
+  return GAME_KEYS.map((gameKey, defaultOrder) => {
+    const doc = byKey.get(gameKey);
+
+    return {
+      gameKey,
+      unlocked: doc ? doc.unlocked : false,
+      order: Number.isInteger(doc?.order) ? doc.order : defaultOrder,
+      updatedBy: doc ? doc.updatedBy : null,
+      updatedAt: doc ? doc.updatedAt : null,
+    };
+  }).sort((a, b) => a.order - b.order || GAME_KEYS.indexOf(a.gameKey) - GAME_KEYS.indexOf(b.gameKey));
+}
+
+// Public: homepage and game gates use this to obtain unlock state and order.
 app.get('/api/game-access', async (req, res) => {
   try {
-    const docs = await GameAccess.find({ gameKey: { $in: GAME_KEYS } });
-    const byKey = new Map(docs.map((d) => [d.gameKey, d]));
-
-    const rows = GAME_KEYS.map((gameKey) => {
-      const doc = byKey.get(gameKey);
-      return {
-        gameKey,
-        unlocked: doc ? doc.unlocked : false,
-        updatedBy: doc ? doc.updatedBy : null,
-        updatedAt: doc ? doc.updatedAt : null,
-      };
-    });
-
-    res.json(rows);
+    res.json(await getGameAccessRows());
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not load game access' });
+  }
+});
+
+// Lock or unlock one game.
+app.put('/api/game-access/:gameKey', async (req, res) => {
+  try {
+    const { gameKey } = req.params;
+    const { unlocked, teacherCode } = req.body;
+
+    const teacherName = lookupTeacher(teacherCode);
+    if (!teacherName) {
+      return res.status(401).json({ error: 'Invalid or missing teacher code' });
+    }
+
+    if (!GAME_KEYS.includes(gameKey)) {
+      return res.status(400).json({ error: `gameKey must be one of: ${GAME_KEYS.join(', ')}` });
+    }
+
+    if (typeof unlocked !== 'boolean') {
+      return res.status(400).json({ error: 'unlocked must be true or false' });
+    }
+
+    const existing = await GameAccess.findOne({ gameKey }).select('order');
+    const defaultOrder = GAME_KEYS.indexOf(gameKey);
+
+    const doc = await GameAccess.findOneAndUpdate(
+      { gameKey },
+      {
+        $set: {
+          unlocked,
+          updatedBy: teacherName,
+          updatedAt: new Date(),
+        },
+        $setOnInsert: {
+          order: defaultOrder,
+        },
+      },
+      { upsert: true, new: true }
+    );
+
+    res.json({
+      ok: true,
+      gameKey: doc.gameKey,
+      unlocked: doc.unlocked,
+      order: Number.isInteger(existing?.order) ? existing.order : doc.order,
+      updatedBy: doc.updatedBy,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not update game access' });
+  }
+});
+
+// Teacher-only: save the complete game order after a drag-and-drop action.
+app.put('/api/game-access/order', async (req, res) => {
+  try {
+    const { gameKeys, teacherCode } = req.body;
+    const teacherName = lookupTeacher(teacherCode);
+
+    if (!teacherName) {
+      return res.status(401).json({ error: 'Invalid or missing teacher code' });
+    }
+
+    const validList =
+      Array.isArray(gameKeys) &&
+      gameKeys.length === GAME_KEYS.length &&
+      new Set(gameKeys).size === GAME_KEYS.length &&
+      gameKeys.every((key) => GAME_KEYS.includes(key));
+
+    if (!validList) {
+      return res.status(400).json({
+        error: `gameKeys must contain every game exactly once: ${GAME_KEYS.join(', ')}`,
+      });
+    }
+
+    const now = new Date();
+
+    await GameAccess.bulkWrite(
+      gameKeys.map((gameKey, order) => ({
+        updateOne: {
+          filter: { gameKey },
+          update: {
+            $set: {
+              order,
+              updatedBy: teacherName,
+              updatedAt: now,
+            },
+            $setOnInsert: {
+              unlocked: false,
+            },
+          },
+          upsert: true,
+        },
+      }))
+    );
+
+    res.json({
+      ok: true,
+      rows: await getGameAccessRows(),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not save game order' });
   }
 });
 
