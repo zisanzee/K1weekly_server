@@ -209,13 +209,22 @@ app.post('/api/game-access/:gameKey', async (req, res) => {
       return res.status(400).json({ error: `gameKey must be one of: ${GAME_KEYS.join(', ')}` });
     }
 
-    const order = await GameAccess.countDocuments({
+    const lastAddedGame = await GameAccess.findOne({
       classId: teacher.classId,
       added: true,
-    });
+    })
+      .sort({ order: -1 })
+      .select('order')
+      .lean();
+
+    const order = Number.isFinite(lastAddedGame?.order)
+      ? lastAddedGame.order + 1
+      : 0;
 
     await GameAccess.findOneAndUpdate(
-      { classId: teacher.classId, gameKey, added: true },
+      // Match a previously removed record as well. Filtering on `added: true`
+      // here would upsert a duplicate classId + gameKey document instead.
+      { classId: teacher.classId, gameKey },
       {
         $set: {
           added: true,
@@ -294,7 +303,7 @@ app.put('/api/game-access/:gameKey/shiny', async (req, res) => {
     }
 
     const doc = await GameAccess.findOneAndUpdate(
-      { classId: teacher.classId, gameKey },
+      { classId: teacher.classId, gameKey, added: true },
       {
         $set: {
           shiny,
