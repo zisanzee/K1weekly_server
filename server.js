@@ -9,7 +9,10 @@ const cors = require('cors');
 
 const PlaySession = require('./models/PlaySession');
 const GameAccess = require('./models/GameAccess');
-const { lookupTeacher, getClasses, isKnownClass } = require('./teacherCodes');
+const Teacher = require('./models/Teacher');
+const ClassInfo = require('./models/ClassInfo');
+const Student = require('./models/Student');
+const { lookupTeacher, getClasses, isKnownClass, seedDirectoryIfEmpty } = require('./directory');
 
 const app = express();
 
@@ -78,23 +81,101 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-app.get('/api/classes', (req, res) => {
-  res.json(getClasses());
+app.get('/api/classes', async (req, res) => {
+  try {
+    res.json(await getClasses());
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load classes' });
+  }
 });
 
-function classIdFromRequest(req) {
+// Class name/image plus the teachers assigned to it (derived from Teacher,
+// not stored on the class, so it can't go stale).
+app.get('/api/classes/:classId', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    if (!(await isKnownClass(classId))) {
+      return res.status(404).json({ error: 'Class not found' });
+    }
+
+    const [classInfo, teachers] = await Promise.all([
+      ClassInfo.findOne({ classId }).lean(),
+      Teacher.find({ classId }).select('name -_id').lean(),
+    ]);
+
+    res.json({
+      classId,
+      className: classInfo?.className || classId,
+      image: classInfo?.image || null,
+      teachers: teachers.map((teacher) => teacher.name),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load class information' });
+  }
+});
+
+async // Roster for a class — teacher-only, same gating style as /api/stats.
+app.get('/api/students', async (req, res) => {
+  try {
+    const teacher = await requireTeacher(req, res);
+    if (!teacher) return;
+
+    const students = await Student.find({ classId: teacher.classId })
+      .sort({ createdAt: 1 })
+      .select('studentId fullName nickname -_id');
+
+    res.json(students);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load students' });
+  }
+});
+
+// Adds a student to the requesting teacher's own class.
+app.post('/api/students', async (req, res) => {
+  try {
+    const teacher = await requireTeacher(req, res);
+    if (!teacher) return;
+
+    const fullName = (req.body.fullName || '').toString().trim().slice(0, 80);
+    const nickname = (req.body.nickname || '').toString().trim().slice(0, 40);
+
+    if (!fullName) {
+      return res.status(400).json({ error: 'fullName is required' });
+    }
+
+    const student = await Student.create({
+      classId: teacher.classId,
+      fullName,
+      nickname,
+    });
+
+    res.status(201).json({
+      studentId: student.studentId,
+      fullName: student.fullName,
+      nickname: student.nickname,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not add student' });
+  }
+});
+
+async function classIdFromRequest(req) {
   const classId = (req.query.classId || req.body?.classId || '')
     .toString()
     .trim();
-  return isKnownClass(classId) ? classId : null;
+  return (await isKnownClass(classId)) ? classId : null;
 }
 
-function teacherFromRequest(req) {
+async function teacherFromRequest(req) {
   return lookupTeacher(req.query.teacherCode || req.body?.teacherCode);
 }
 
-function requireTeacher(req, res) {
-  const teacher = teacherFromRequest(req);
+async function requireTeacher(req, res) {
+  const teacher = await teacherFromRequest(req);
   if (!teacher) {
     res.status(401).json({ error: 'Invalid or missing teacher code' });
     return null;
@@ -102,8 +183,8 @@ function requireTeacher(req, res) {
   return teacher;
 }
 
-function requireClass(req, res) {
-  const classId = classIdFromRequest(req);
+async function requireClass(req, res) {
+  const classId = await classIdFromRequest(req);
   if (!classId) {
     res.status(400).json({ error: 'A valid classId is required' });
     return null;
@@ -135,7 +216,7 @@ async function getGameAccessRows(classId) {
 // Public endpoint used by the homepage, game gates, and teacher panel.
 app.get('/api/game-access', async (req, res) => {
   try {
-    const classId = requireClass(req, res);
+    const classId = await requireClass(req, res);
     if (!classId) return;
     res.json(await getGameAccessRows(classId));
   } catch (err) {
@@ -149,7 +230,7 @@ app.get('/api/game-access', async (req, res) => {
 app.put('/api/game-access/order', async (req, res) => {
   try {
     const { gameKeys } = req.body;
-    const teacher = requireTeacher(req, res);
+    const teacher = await requireTeacher(req, res);
 
     if (!teacher) return;
 
@@ -203,7 +284,7 @@ app.put('/api/game-access/order', async (req, res) => {
 app.post('/api/game-access/:gameKey', async (req, res) => {
   try {
     const { gameKey } = req.params;
-    const teacher = requireTeacher(req, res);
+    const teacher = await requireTeacher(req, res);
     if (!teacher) return;
     if (!GAME_KEYS.includes(gameKey)) {
       return res.status(400).json({ error: `gameKey must be one of: ${GAME_KEYS.join(', ')}` });
@@ -251,7 +332,7 @@ app.post('/api/game-access/:gameKey', async (req, res) => {
 app.delete('/api/game-access/:gameKey', async (req, res) => {
   try {
     const { gameKey } = req.params;
-    const teacher = requireTeacher(req, res);
+    const teacher = await requireTeacher(req, res);
     if (!teacher) return;
     if (!GAME_KEYS.includes(gameKey)) {
       return res.status(400).json({ error: `gameKey must be one of: ${GAME_KEYS.join(', ')}` });
@@ -286,7 +367,7 @@ app.put('/api/game-access/:gameKey/shiny', async (req, res) => {
     const { gameKey } = req.params;
     const { shiny } = req.body;
 
-    const teacher = requireTeacher(req, res);
+    const teacher = await requireTeacher(req, res);
 
     if (!teacher) return;
 
@@ -338,7 +419,7 @@ app.put('/api/game-access/:gameKey', async (req, res) => {
     const { gameKey } = req.params;
     const { unlocked } = req.body;
 
-    const teacher = requireTeacher(req, res);
+    const teacher = await requireTeacher(req, res);
 
     if (!teacher) return;
 
@@ -407,7 +488,7 @@ app.post('/api/plays', async (req, res) => {
       });
     }
 
-    const classId = isKnownClass(requestedClassId) ? requestedClassId : null;
+    const classId = (await isKnownClass(requestedClassId)) ? requestedClassId : null;
     if (!classId) {
       return res.status(400).json({ error: 'A valid classId is required' });
     }
@@ -469,7 +550,7 @@ app.post('/api/plays', async (req, res) => {
 app.delete('/api/plays', async (req, res) => {
   try {
     const { game, playerName } = req.body;
-    const teacher = requireTeacher(req, res);
+    const teacher = await requireTeacher(req, res);
     if (!teacher) return;
 
     if (!KNOWN_GAMES.includes(game)) {
@@ -499,7 +580,7 @@ app.delete('/api/plays', async (req, res) => {
 // Overall totals and per-game statistics.
 app.get('/api/stats', async (req, res) => {
   try {
-    const teacher = requireTeacher(req, res);
+    const teacher = await requireTeacher(req, res);
     if (!teacher) return;
     const match = { classId: teacher.classId };
     const totalPlays = await PlaySession.countDocuments(match);
@@ -534,8 +615,8 @@ app.get('/api/stats', async (req, res) => {
 // One row per player and game.
 app.get('/api/summary', async (req, res) => {
   try {
-    const teacher = teacherFromRequest(req);
-    const classId = teacher?.classId || classIdFromRequest(req);
+    const teacher = await teacherFromRequest(req);
+    const classId = teacher?.classId || (await classIdFromRequest(req));
     const playerName = (req.query.playerName || '').toString().trim();
 
     if (!classId || (!teacher && !playerName)) {
@@ -597,7 +678,7 @@ app.get('/api/summary', async (req, res) => {
 // Every play session, newest first.
 app.get('/api/plays', async (req, res) => {
   try {
-    const teacher = requireTeacher(req, res);
+    const teacher = await requireTeacher(req, res);
     if (!teacher) return;
     const plays = await PlaySession.find({ classId: teacher.classId })
       .sort({ completedAt: -1 })
@@ -617,7 +698,7 @@ app.get('/api/plays', async (req, res) => {
 // Top ten runs for one game.
 app.get('/api/leaderboard/:game', async (req, res) => {
   try {
-    const classId = requireClass(req, res);
+    const classId = await requireClass(req, res);
     if (!classId) return;
     const top = await PlaySession.find({
       classId,
@@ -695,6 +776,7 @@ async function migrateLegacyClassData() {
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(async () => {
+    await seedDirectoryIfEmpty();
     await migrateLegacyClassData();
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
