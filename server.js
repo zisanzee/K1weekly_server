@@ -116,7 +116,7 @@ app.get('/api/classes/:classId', async (req, res) => {
   }
 });
 
-async // Roster for a class — teacher-only, same gating style as /api/stats.
+// Roster for a class — teacher-only, same gating style as /api/stats.
 app.get('/api/students', async (req, res) => {
   try {
     const teacher = await requireTeacher(req, res);
