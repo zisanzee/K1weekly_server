@@ -5,6 +5,9 @@ const gameAccessSchema = new mongoose.Schema({
   // records created before class support in the original K1 class.
   classId: { type: String, required: true, default: 'k12026-pny', index: true },
   gameKey: { type: String, required: true },
+
+  // A class sees only games its teacher has added from the game shop.
+  added: { type: Boolean, default: false },
   unlocked: { type: Boolean, default: false },
 
   // Zero-based order in the teacher panel and homepage.

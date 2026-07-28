@@ -111,28 +111,21 @@ function requireClass(req, res) {
   return classId;
 }
 
-// Produces a complete ordered game list even before every game has a MongoDB
-// document. Existing data without `order` or `shiny` safely uses defaults.
+// Returns only games that the class teacher has added from the shop.
 async function getGameAccessRows(classId) {
   const docs = await GameAccess.find({
     classId,
     gameKey: { $in: GAME_KEYS },
+    added: true,
   });
-
-  const byKey = new Map(docs.map((doc) => [doc.gameKey, doc]));
-
-  return GAME_KEYS.map((gameKey, defaultOrder) => {
-    const doc = byKey.get(gameKey);
-
-    return {
-      gameKey,
-      unlocked: doc ? Boolean(doc.unlocked) : false,
-      shiny: doc ? Boolean(doc.shiny) : false,
-      order: Number.isInteger(doc?.order) ? doc.order : defaultOrder,
-      updatedBy: doc ? doc.updatedBy : null,
-      updatedAt: doc ? doc.updatedAt : null,
-    };
-  }).sort(
+  return docs.map((doc) => ({
+    gameKey: doc.gameKey,
+    unlocked: Boolean(doc.unlocked),
+    shiny: Boolean(doc.shiny),
+    order: Number.isInteger(doc.order) ? doc.order : GAME_KEYS.indexOf(doc.gameKey),
+    updatedBy: doc.updatedBy,
+    updatedAt: doc.updatedAt,
+  })).sort(
     (a, b) =>
       a.order - b.order ||
       GAME_KEYS.indexOf(a.gameKey) - GAME_KEYS.indexOf(b.gameKey)
@@ -160,15 +153,20 @@ app.put('/api/game-access/order', async (req, res) => {
 
     if (!teacher) return;
 
+    const addedKeys = await GameAccess.distinct('gameKey', {
+      classId: teacher.classId,
+      added: true,
+    });
+
     const validList =
       Array.isArray(gameKeys) &&
-      gameKeys.length === GAME_KEYS.length &&
-      new Set(gameKeys).size === GAME_KEYS.length &&
-      gameKeys.every((key) => GAME_KEYS.includes(key));
+      gameKeys.length === addedKeys.length &&
+      new Set(gameKeys).size === addedKeys.length &&
+      gameKeys.every((key) => addedKeys.includes(key));
 
     if (!validList) {
       return res.status(400).json({
-        error: `gameKeys must contain every game exactly once: ${GAME_KEYS.join(', ')}`,
+        error: 'gameKeys must contain every game currently added to this class exactly once',
       });
     }
 
@@ -177,20 +175,15 @@ app.put('/api/game-access/order', async (req, res) => {
     await GameAccess.bulkWrite(
       gameKeys.map((gameKey, order) => ({
         updateOne: {
-          filter: { classId: teacher.classId, gameKey },
+          filter: { classId: teacher.classId, gameKey, added: true },
           update: {
             $set: {
               order,
               updatedBy: teacher.name,
               updatedAt,
             },
-            $setOnInsert: {
-              classId: teacher.classId,
-              unlocked: false,
-              shiny: false,
-            },
           },
-          upsert: true,
+          upsert: false,
         },
       }))
     );
@@ -202,6 +195,78 @@ app.put('/api/game-access/order', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not save game order' });
+  }
+});
+
+// Adds a game from the teacher's shop. Re-adding a removed game places it at
+// the end of the class list and starts it locked.
+app.post('/api/game-access/:gameKey', async (req, res) => {
+  try {
+    const { gameKey } = req.params;
+    const teacher = requireTeacher(req, res);
+    if (!teacher) return;
+    if (!GAME_KEYS.includes(gameKey)) {
+      return res.status(400).json({ error: `gameKey must be one of: ${GAME_KEYS.join(', ')}` });
+    }
+
+    const order = await GameAccess.countDocuments({
+      classId: teacher.classId,
+      added: true,
+    });
+
+    await GameAccess.findOneAndUpdate(
+      { classId: teacher.classId, gameKey, added: true },
+      {
+        $set: {
+          added: true,
+          unlocked: false,
+          shiny: false,
+          order,
+          updatedBy: teacher.name,
+          updatedAt: new Date(),
+        },
+        $setOnInsert: { classId: teacher.classId },
+      },
+      { upsert: true, new: true }
+    );
+
+    res.status(201).json({ ok: true, rows: await getGameAccessRows(teacher.classId) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not add game to class' });
+  }
+});
+
+// Keeps a disabled record instead of deleting it, so the legacy class's
+// one-time migration never brings a teacher-removed game back.
+app.delete('/api/game-access/:gameKey', async (req, res) => {
+  try {
+    const { gameKey } = req.params;
+    const teacher = requireTeacher(req, res);
+    if (!teacher) return;
+    if (!GAME_KEYS.includes(gameKey)) {
+      return res.status(400).json({ error: `gameKey must be one of: ${GAME_KEYS.join(', ')}` });
+    }
+
+    const doc = await GameAccess.findOneAndUpdate(
+      { classId: teacher.classId, gameKey, added: true },
+      {
+        $set: {
+          added: false,
+          unlocked: false,
+          shiny: false,
+          updatedBy: teacher.name,
+          updatedAt: new Date(),
+        },
+      },
+      { new: true }
+    );
+
+    if (!doc) return res.status(404).json({ error: 'This game is not in the class' });
+    res.json({ ok: true, rows: await getGameAccessRows(teacher.classId) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not remove game from class' });
   }
 });
 
@@ -236,17 +301,13 @@ app.put('/api/game-access/:gameKey/shiny', async (req, res) => {
           updatedBy: teacher.name,
           updatedAt: new Date(),
         },
-        $setOnInsert: {
-          classId: teacher.classId,
-          unlocked: false,
-          order: GAME_KEYS.indexOf(gameKey),
-        },
       },
       {
-        upsert: true,
         new: true,
       }
     );
+
+    if (!doc) return res.status(404).json({ error: 'Add this game to the class first' });
 
     res.json({
       ok: true,
@@ -285,24 +346,20 @@ app.put('/api/game-access/:gameKey', async (req, res) => {
     }
 
     const doc = await GameAccess.findOneAndUpdate(
-      { classId: teacher.classId, gameKey },
+      { classId: teacher.classId, gameKey, added: true },
       {
         $set: {
           unlocked,
           updatedBy: teacher.name,
           updatedAt: new Date(),
         },
-        $setOnInsert: {
-          classId: teacher.classId,
-          order: GAME_KEYS.indexOf(gameKey),
-          shiny: false,
-        },
       },
       {
-        upsert: true,
         new: true,
       }
     );
+
+    if (!doc) return res.status(404).json({ error: 'Add this game to the class first' });
 
     res.json({
       ok: true,
@@ -586,6 +643,32 @@ async function migrateLegacyClassData() {
       { $set: { classId: LEGACY_CLASS_ID } }
     ),
   ]);
+
+  // The original K1 class had every game available before the shop existed.
+  // Mark old settings as added and create a persistent record for every
+  // legacy game once. Removed games retain an `added: false` record.
+  await GameAccess.updateMany(
+    { classId: LEGACY_CLASS_ID, added: { $exists: false } },
+    { $set: { added: true } }
+  );
+  await GameAccess.bulkWrite(
+    GAME_KEYS.map((gameKey, order) => ({
+      updateOne: {
+        filter: { classId: LEGACY_CLASS_ID, gameKey },
+        update: {
+          $setOnInsert: {
+            classId: LEGACY_CLASS_ID,
+            gameKey,
+            added: true,
+            unlocked: false,
+            shiny: false,
+            order,
+          },
+        },
+        upsert: true,
+      },
+    }))
+  );
 
   // Old releases created a globally-unique gameKey index. Replace it with
   // the classId + gameKey index declared by the model so every class can
