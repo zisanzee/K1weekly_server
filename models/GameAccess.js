@@ -1,7 +1,10 @@
 const mongoose = require('mongoose');
 
 const gameAccessSchema = new mongoose.Schema({
-  gameKey: { type: String, required: true, unique: true },
+  // Settings belong to a class, not to the whole site. The default keeps
+  // records created before class support in the original K1 class.
+  classId: { type: String, required: true, default: 'k12026-pny', index: true },
+  gameKey: { type: String, required: true },
   unlocked: { type: Boolean, default: false },
 
   // Zero-based order in the teacher panel and homepage.
@@ -13,5 +16,7 @@ const gameAccessSchema = new mongoose.Schema({
   updatedBy: { type: String, default: null },
   updatedAt: { type: Date, default: Date.now },
 });
+
+gameAccessSchema.index({ classId: 1, gameKey: 1 }, { unique: true });
 
 module.exports = mongoose.model('GameAccess', gameAccessSchema);

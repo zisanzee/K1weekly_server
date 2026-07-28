@@ -1,6 +1,8 @@
 const mongoose = require('mongoose');
 
 const playSessionSchema = new mongoose.Schema({
+  // Legacy sessions did not have a class. They are the original K1 class.
+  classId: { type: String, required: true, default: 'k12026-pny', index: true },
   game: { type: String, required: true }, // e.g. "game1", "game2", "game3"
   playerName: { type: String, default: 'Guest' },
   stars: { type: Number, required: true },
@@ -23,5 +25,7 @@ const playSessionSchema = new mongoose.Schema({
     userAgent: { type: String },
   },
 });
+
+playSessionSchema.index({ classId: 1, playerName: 1, game: 1 });
 
 module.exports = mongoose.model('PlaySession', playSessionSchema);

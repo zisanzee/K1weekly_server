@@ -1,5 +1,17 @@
 # K1 Weekly Wonders — Play-Logging Server Setup
 
+## Classes and legacy data
+
+Each teacher code in `teacherCodes.js` has a `classId` and `className`.
+Players choose one of those classes before playing. Play history, the teacher
+dashboard, game order, locked/unlocked games, and featured games are all
+isolated by that class ID.
+
+When this server first starts after the class update, it automatically assigns
+all older `PlaySession` and `GameAccess` documents to `k12026-pny` (the
+original K1 class) and replaces the former globally-unique game-setting index
+with a class-specific one. No manual database migration is needed.
+
 This adds a tiny free backend that logs every completed game (which game,
 who played, their score, and their best streak), so you can see who played
 and how many times.
