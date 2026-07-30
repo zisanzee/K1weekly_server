@@ -16,7 +16,11 @@ const { lookupTeacher, getClasses, isKnownClass, seedDirectoryIfEmpty } = requir
 
 const app = express();
 
-const GAME_KEYS = ['1', '2', '3', '4', '5', '6', 'b1'];
+const GAME_KEYS = ['1', '2', '3', '4', '5', '6', '7', 'b1'];
+// Accept any non-empty alphanumeric game key — adding new games to the
+// frontend catalog no longer requires a server-side edit beyond adding
+// the key to GAME_KEYS above.
+const GAME_KEY_RE = /^[a-zA-Z0-9_]+$/;
 const PORT = process.env.PORT || 4000;
 const LEGACY_CLASS_ID = 'k12026-pny';
 
@@ -51,28 +55,10 @@ app.use(
 
 app.use(express.json());
 
-const KNOWN_GAMES = [
-  'game1',
-  'game2',
-  'game3',
-  'game4',
-  'game5',
-  'game6',
-  'game7',
-  'game8',
-  'game9',
-  'game10',
-  'bonusGame1',
-  'bonusGame2',
-  'bonusGame3',
-  'bonusGame4',
-  'bonusGame5',
-  'bonusGame6',
-  'bonusGame7',
-  'bonusGame8',
-  'bonusGame9',
-  'bonusGame10',
-];
+// Accept any slug that starts with a letter followed by alphanumeric chars
+// (e.g. "game1", "game7", "bonusGame1") — no need to re-deploy the server
+// when adding new games to the frontend.
+const GAME_SLUG_RE = /^[a-zA-Z][a-zA-Z0-9]*$/;
 
 app.get('/api/health', (req, res) => {
   res.json({
@@ -286,8 +272,8 @@ app.post('/api/game-access/:gameKey', async (req, res) => {
     const { gameKey } = req.params;
     const teacher = await requireTeacher(req, res);
     if (!teacher) return;
-    if (!GAME_KEYS.includes(gameKey)) {
-      return res.status(400).json({ error: `gameKey must be one of: ${GAME_KEYS.join(', ')}` });
+    if (!GAME_KEY_RE.test(gameKey)) {
+      return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
     }
 
     const lastAddedGame = await GameAccess.findOne({
@@ -334,8 +320,8 @@ app.delete('/api/game-access/:gameKey', async (req, res) => {
     const { gameKey } = req.params;
     const teacher = await requireTeacher(req, res);
     if (!teacher) return;
-    if (!GAME_KEYS.includes(gameKey)) {
-      return res.status(400).json({ error: `gameKey must be one of: ${GAME_KEYS.join(', ')}` });
+    if (!GAME_KEY_RE.test(gameKey)) {
+      return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
     }
 
     const doc = await GameAccess.findOneAndUpdate(
@@ -371,10 +357,8 @@ app.put('/api/game-access/:gameKey/shiny', async (req, res) => {
 
     if (!teacher) return;
 
-    if (!GAME_KEYS.includes(gameKey)) {
-      return res.status(400).json({
-        error: `gameKey must be one of: ${GAME_KEYS.join(', ')}`,
-      });
+    if (!GAME_KEY_RE.test(gameKey)) {
+      return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
     }
 
     if (typeof shiny !== 'boolean') {
@@ -423,10 +407,8 @@ app.put('/api/game-access/:gameKey', async (req, res) => {
 
     if (!teacher) return;
 
-    if (!GAME_KEYS.includes(gameKey)) {
-      return res.status(400).json({
-        error: `gameKey must be one of: ${GAME_KEYS.join(', ')}`,
-      });
+    if (!GAME_KEY_RE.test(gameKey)) {
+      return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
     }
 
     if (typeof unlocked !== 'boolean') {
@@ -482,10 +464,8 @@ app.post('/api/plays', async (req, res) => {
       device,
     } = req.body;
 
-    if (!KNOWN_GAMES.includes(game)) {
-      return res.status(400).json({
-        error: `game must be one of: ${KNOWN_GAMES.join(', ')}`,
-      });
+    if (!GAME_SLUG_RE.test(game)) {
+      return res.status(400).json({ error: `Invalid game slug: "${game}"` });
     }
 
     const classId = (await isKnownClass(requestedClassId)) ? requestedClassId : null;
@@ -553,10 +533,8 @@ app.delete('/api/plays', async (req, res) => {
     const teacher = await requireTeacher(req, res);
     if (!teacher) return;
 
-    if (!KNOWN_GAMES.includes(game)) {
-      return res.status(400).json({
-        error: `game must be one of: ${KNOWN_GAMES.join(', ')}`,
-      });
+    if (!GAME_SLUG_RE.test(game)) {
+      return res.status(400).json({ error: `Invalid game slug: "${game}"` });
     }
 
     const result = await PlaySession.deleteMany({
