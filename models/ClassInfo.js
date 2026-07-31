@@ -9,6 +9,14 @@ const classInfoSchema = new mongoose.Schema({
   // A URL/path to the class photo. Left null until a teacher uploads one;
   // the frontend renders a placeholder whenever this is empty.
   image: { type: String, default: null },
+  // Determines which game arrangement this class sees. 'k1' and 'k2' are
+  // the current values; add more here if new class types are introduced.
+  classType: {
+    type: String,
+    enum: ['k1', 'k2'],
+    default: 'k1',
+    required: true,
+  },
 });
 
 module.exports = mongoose.model('ClassInfo', classInfoSchema);

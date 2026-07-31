@@ -110,7 +110,7 @@ app.get('/api/students', async (req, res) => {
 
     const students = await Student.find({ classId: teacher.classId })
       .sort({ createdAt: 1 })
-      .select('studentId fullName nickname -_id');
+      .select('studentId fullName nickname group code -_id');
 
     res.json(students);
   } catch (err) {
@@ -119,33 +119,146 @@ app.get('/api/students', async (req, res) => {
   }
 });
 
-// Adds a student to the requesting teacher's own class.
+// Adds a student to the requesting teacher's own class. The frontend
+// generates a 6-char login code — the server stores it as-is and
+// enforces uniqueness via the model's unique index.
 app.post('/api/students', async (req, res) => {
   try {
     const teacher = await requireTeacher(req, res);
     if (!teacher) return;
 
-    const fullName = (req.body.fullName || '').toString().trim().slice(0, 80);
     const nickname = (req.body.nickname || '').toString().trim().slice(0, 40);
+    const fullName = (req.body.fullName || nickname || '').toString().trim().slice(0, 80);
+    const group = (req.body.group || '').toString().trim().slice(0, 40);
+    const code = (req.body.code || '').toString().trim().toUpperCase();
 
-    if (!fullName) {
-      return res.status(400).json({ error: 'fullName is required' });
+    if (!nickname) {
+      return res.status(400).json({ error: 'nickname is required' });
+    }
+
+    if (!code || code.length !== 6) {
+      return res.status(400).json({ error: 'A 6-character student code is required' });
+    }
+
+    // Check for duplicate code before attempting insert — gives a cleaner
+    // error message than letting Mongo's unique constraint fail.
+    const existing = await Student.findOne({ code });
+    if (existing) {
+      return res.status(409).json({ error: 'This code is already in use. Please try again.' });
     }
 
     const student = await Student.create({
       classId: teacher.classId,
       fullName,
       nickname,
+      group,
+      code,
     });
 
     res.status(201).json({
       studentId: student.studentId,
       fullName: student.fullName,
       nickname: student.nickname,
+      group: student.group,
+      code: student.code,
     });
   } catch (err) {
     console.error(err);
+    // If the unique constraint fires despite the pre-check (race condition),
+    // return a friendly message instead of the raw Mongo error.
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'This code is already in use. Please try again.' });
+    }
     res.status(500).json({ error: 'Could not add student' });
+  }
+});
+
+// Update a student's nickname and/or group. The code cannot be edited.
+// Teacher-only, scoped to their own class.
+app.put('/api/students/:studentId', async (req, res) => {
+  try {
+    const teacher = await requireTeacher(req, res);
+    if (!teacher) return;
+
+    const { studentId } = req.params;
+    const nickname = (req.body.nickname || '').toString().trim().slice(0, 40);
+    const group = (req.body.group || '').toString().trim().slice(0, 40);
+
+    if (!nickname) {
+      return res.status(400).json({ error: 'nickname is required' });
+    }
+
+    const student = await Student.findOneAndUpdate(
+      { studentId, classId: teacher.classId },
+      { $set: { nickname, group } },
+      { new: true }
+    ).select('studentId fullName nickname group code -_id');
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found in your class' });
+    }
+
+    res.json(student);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not update student' });
+  }
+});
+
+// Remove a student from the roster. Teacher-only, scoped to their own class.
+app.delete('/api/students/:studentId', async (req, res) => {
+  try {
+    const teacher = await requireTeacher(req, res);
+    if (!teacher) return;
+
+    const { studentId } = req.params;
+
+    const result = await Student.deleteOne({
+      studentId,
+      classId: teacher.classId,
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: 'Student not found in your class' });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not delete student' });
+  }
+});
+
+// Public — validates a student login code and returns the student's info
+// plus their class details so the frontend can auto-log them in.
+app.get('/api/student-login/:code', async (req, res) => {
+  try {
+    const code = (req.params.code || '').toString().trim().toUpperCase();
+
+    if (!code || code.length !== 6) {
+      return res.status(400).json({ error: 'Invalid student code' });
+    }
+
+    const student = await Student.findOne({ code })
+      .select('studentId fullName nickname group code classId -_id')
+      .lean();
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student code not found' });
+    }
+
+    const classInfo = await ClassInfo.findOne({ classId: student.classId })
+      .select('classId className classType -_id')
+      .lean();
+
+    if (!classInfo) {
+      return res.status(500).json({ error: 'Class not found for this student' });
+    }
+
+    res.json({ student, classInfo });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not validate student code' });
   }
 });
 
@@ -751,11 +864,63 @@ async function migrateLegacyClassData() {
   await PlaySession.syncIndexes();
 }
 
+// Assigns random 6-character codes to existing students that don't have one
+// (added during the student-code feature rollout). Uses the same character
+// set as the frontend's generateStudentCode().
+async function migrateStudentCodes() {
+  const CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  function makeCode() {
+    let code = '';
+    for (let i = 0; i < 6; i++) code += CHARS[Math.floor(Math.random() * CHARS.length)];
+    return code;
+  }
+
+  const studentsWithoutCode = await Student.find({ code: { $exists: false } }).select('_id');
+  if (studentsWithoutCode.length === 0) return;
+
+  const existingCodes = new Set(
+    (await Student.find({ code: { $exists: true } }).select('code -_id').lean())
+      .map((s) => s.code)
+  );
+
+  const bulkOps = [];
+  for (const student of studentsWithoutCode) {
+    let code;
+    do { code = makeCode(); } while (existingCodes.has(code));
+    existingCodes.add(code);
+    bulkOps.push({
+      updateOne: {
+        filter: { _id: student._id },
+        update: { $set: { code, group: '' } },
+      },
+    });
+  }
+
+  if (bulkOps.length > 0) {
+    await Student.bulkWrite(bulkOps);
+    console.log(`Assigned codes to ${bulkOps.length} existing students`);
+  }
+}
+
+// Ensure every ClassInfo doc has a classType (defaults to 'k1').
+async function migrateClassTypes() {
+  const result = await ClassInfo.updateMany(
+    { classType: { $exists: false } },
+    { $set: { classType: 'k1' } }
+  );
+  if (result.modifiedCount > 0) {
+    console.log(`Set classType to 'k1' for ${result.modifiedCount} classes`);
+  }
+}
+
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(async () => {
     await seedDirectoryIfEmpty();
     await migrateLegacyClassData();
+    await migrateClassTypes();
+    await migrateStudentCodes();
+    await Student.syncIndexes();
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
     });
