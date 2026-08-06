@@ -55,6 +55,22 @@ app.use(
 
 app.use(express.json());
 
+// Hard request timeout — if any route handler (including slow DB queries)
+// takes longer than 15 s, the connection is terminated with a 504 so the
+// client gets a clear signal instead of an indefinite hang.
+app.use((_req, res, next) => {
+  const timer = setTimeout(() => {
+    if (!res.headersSent) {
+      res.status(504).json({ error: 'Request timed out — please try again.' });
+    }
+  }, 15_000);
+
+  res.on('finish', () => clearTimeout(timer));
+  res.on('close', () => clearTimeout(timer));
+
+  next();
+});
+
 // Accept any slug that starts with a letter followed by alphanumeric chars
 // (e.g. "game1", "game7", "bonusGame1") — no need to re-deploy the server
 // when adding new games to the frontend.
@@ -292,12 +308,14 @@ async function requireClass(req, res) {
 }
 
 // Returns only games that the class teacher has added from the shop.
+// Uses .lean() to skip Mongoose document overhead — plain objects are
+// faster and we don't need setters/save/virtuals here.
 async function getGameAccessRows(classId) {
   const docs = await GameAccess.find({
     classId,
     gameKey: { $in: GAME_KEYS },
     added: true,
-  });
+  }).lean();
   return docs.map((doc) => ({
     gameKey: doc.gameKey,
     unlocked: Boolean(doc.unlocked),
