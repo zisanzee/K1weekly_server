@@ -328,6 +328,22 @@ async function classIdFromRequest(req) {
   return (await isKnownClass(classId)) ? classId : null;
 }
 
+// In-memory cache: classId → classType. These mappings never change during
+// a server's lifetime (changing a class's type requires a redeploy or an
+// admin endpoint that clears the cache), so the cache lives for the entire
+// process. Eliminates a redundant ClassInfo query on every game-access read.
+const classTypeCache = new Map();
+
+async function resolveClassType(classId) {
+  const cached = classTypeCache.get(classId);
+  if (cached !== undefined) return cached;
+
+  const doc = await ClassInfo.findOne({ classId }).select('classType -_id').lean();
+  const classType = doc?.classType || null;
+  classTypeCache.set(classId, classType);
+  return classType;
+}
+
 async function teacherFromRequest(req) {
   return lookupTeacher(req.query.teacherCode || req.body?.teacherCode);
 }
@@ -408,9 +424,13 @@ app.get('/api/game-access', async (req, res) => {
     }
 
     // Public/player path: resolves classId → classType server-side.
-    const classId = await requireClass(req, res);
-    if (!classId) return;
-    const classType = await classTypeForClassId(classId);
+    // Uses an in-memory cache — a single ClassInfo lookup on first access,
+    // zero DB queries on subsequent requests for the same classId.
+    const rawId = (req.query.classId || '').toString().trim();
+    if (!rawId) {
+      return res.status(400).json({ error: 'A valid classId is required' });
+    }
+    const classType = await resolveClassType(rawId);
     if (!classType) {
       return res.status(400).json({ error: 'Class not found' });
     }
@@ -1063,9 +1083,11 @@ mongoose.set('bufferCommands', false);
 
 mongoose
   .connect(process.env.MONGODB_URI, {
-    // Close idle connections after 10 s so the network layer (Render's
-    // load-balancer, MongoDB Atlas) never silently drops them first.
-    maxIdleTimeMS: 10_000,
+    // Close idle connections after 12 min — comfortably above the 10-min
+    // cron interval, so the health-check ping always refreshes connections
+    // before they expire. Prevents Render's load-balancer or MongoDB Atlas
+    // from silently dropping them while still recycling truly dead ones.
+    maxIdleTimeMS: 720_000,
     // Fail fast (5 s) instead of the default 30 s if the server can't
     // reach MongoDB at all — avoids a 30-second hang on cold-start.
     serverSelectionTimeoutMS: 5_000,
