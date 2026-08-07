@@ -92,11 +92,19 @@ app.use((_req, res, next) => {
 // when adding new games to the frontend.
 const GAME_SLUG_RE = /^[a-zA-Z][a-zA-Z0-9]*$/;
 
-app.get('/api/health', (req, res) => {
-  res.json({
-    ok: true,
-    dbState: mongoose.connection.readyState,
-  });
+app.get('/api/health', async (req, res) => {
+  try {
+    // A real round-trip to MongoDB — this keeps the connection pool warm
+    // for the cron job (Render spin-down prevention) and prevents MongoDB
+    // Atlas free-tier clusters from pausing after inactivity. The ping is
+    // sub-millisecond when the connection is already established.
+    if (mongoose.connection.readyState === 1) {
+      await mongoose.connection.db.admin().ping();
+    }
+    res.json({ ok: true, dbState: mongoose.connection.readyState });
+  } catch {
+    res.status(503).json({ ok: false, dbState: mongoose.connection.readyState });
+  }
 });
 
 // Validates a teacher code against the DB and returns everything the
@@ -1048,8 +1056,20 @@ async function migrateStudentCodes() {
   }
 }
 
+// Prevent Mongoose from buffering operations while disconnected — if the
+// connection drops, queries fail immediately with a clear error instead of
+// queuing up silently and appearing to hang.
+mongoose.set('bufferCommands', false);
+
 mongoose
-  .connect(process.env.MONGODB_URI)
+  .connect(process.env.MONGODB_URI, {
+    // Close idle connections after 10 s so the network layer (Render's
+    // load-balancer, MongoDB Atlas) never silently drops them first.
+    maxIdleTimeMS: 10_000,
+    // Fail fast (5 s) instead of the default 30 s if the server can't
+    // reach MongoDB at all — avoids a 30-second hang on cold-start.
+    serverSelectionTimeoutMS: 5_000,
+  })
   .then(async () => {
     await seedDirectoryIfEmpty();
     await migrateClassTypeAndGameAccess();
