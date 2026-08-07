@@ -12,7 +12,13 @@ const GameAccess = require('./models/GameAccess');
 const Teacher = require('./models/Teacher');
 const ClassInfo = require('./models/ClassInfo');
 const Student = require('./models/Student');
-const { lookupTeacher, getClasses, isKnownClass, seedDirectoryIfEmpty } = require('./directory');
+const {
+  lookupTeacher,
+  getClasses,
+  isKnownClass,
+  seedDirectoryIfEmpty,
+  classTypeForClassId,
+} = require('./directory');
 
 const app = express();
 
@@ -55,6 +61,16 @@ app.use(
 
 app.use(express.json());
 
+// Prevent browsers from caching any API response. Without this, a stale
+// cached 5xx or empty response can lock users on the loading spinner even
+// after the server recovers — the only fix would be manually clearing
+// their cache. Applies to every route; individual routes can override if
+// needed (none do for now).
+app.use('/api', (_req, res, next) => {
+  res.set('Cache-Control', 'no-store, max-age=0');
+  next();
+});
+
 // Hard request timeout — if any route handler (including slow DB queries)
 // takes longer than 15 s, the connection is terminated with a 504 so the
 // client gets a clear signal instead of an indefinite hang.
@@ -83,6 +99,24 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Validates a teacher code against the DB and returns everything the
+// frontend needs to populate the zustand player store. This replaces the
+// old hardcoded TEACHER_CODES mirror — the server is the single source of
+// truth for teacher auth.
+app.post('/api/teacher-login', async (req, res) => {
+  try {
+    const { code } = req.body;
+    const teacher = await lookupTeacher(code);
+    if (!teacher) {
+      return res.status(401).json({ error: 'Invalid teacher code' });
+    }
+    res.json(teacher);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not validate teacher code' });
+  }
+});
+
 app.get('/api/classes', async (req, res) => {
   try {
     res.json(await getClasses());
@@ -92,8 +126,8 @@ app.get('/api/classes', async (req, res) => {
   }
 });
 
-// Class name/image plus the teachers assigned to it (derived from Teacher,
-// not stored on the class, so it can't go stale).
+// Class name/image/classType plus the teachers assigned to it (derived from
+// Teacher, not stored on the class, so it can't go stale).
 app.get('/api/classes/:classId', async (req, res) => {
   try {
     const { classId } = req.params;
@@ -109,6 +143,7 @@ app.get('/api/classes/:classId', async (req, res) => {
     res.json({
       classId,
       className: classInfo?.className || classId,
+      classType: classInfo?.classType || 'k1',
       image: classInfo?.image || null,
       teachers: teachers.map((teacher) => teacher.name),
     });
@@ -298,6 +333,19 @@ async function requireTeacher(req, res) {
   return teacher;
 }
 
+// Stricter than requireTeacher — additionally checks that the teacher's
+// role is 'admin'. Used to gate all GameAccess write routes (order, lock/
+// unlock, shiny, shop add/remove). Only admins can mutate game config.
+async function requireAdmin(req, res) {
+  const teacher = await requireTeacher(req, res);
+  if (!teacher) return null;
+  if (teacher.role !== 'admin') {
+    res.status(403).json({ error: 'Admins only' });
+    return null;
+  }
+  return teacher;
+}
+
 async function requireClass(req, res) {
   const classId = await classIdFromRequest(req);
   if (!classId) {
@@ -307,12 +355,16 @@ async function requireClass(req, res) {
   return classId;
 }
 
-// Returns only games that the class teacher has added from the shop.
-// Uses .lean() to skip Mongoose document overhead — plain objects are
-// faster and we don't need setters/save/virtuals here.
-async function getGameAccessRows(classId) {
+// Validates that a classType string is one of the known enum values.
+function isValidClassType(value) {
+  return value === 'k1' || value === 'k2';
+}
+
+// Returns the game arrangement for a given classType. Uses .lean() for
+// performance — plain objects, no Mongoose document overhead.
+async function getGameAccessRows(classType) {
   const docs = await GameAccess.find({
-    classId,
+    classType,
     gameKey: { $in: GAME_KEYS },
     added: true,
   }).lean();
@@ -330,29 +382,51 @@ async function getGameAccessRows(classId) {
   );
 }
 
-// Public endpoint used by the homepage, game gates, and teacher panel.
+// Read endpoint — used by the homepage, game gates, and teacher panel.
+// Accepts ?classId= (resolves to classType server-side — contract unchanged)
+// OR ?classType= + teacherCode for admin panel reads. The response shape is
+// identical either way.
 app.get('/api/game-access', async (req, res) => {
   try {
+    // Admin panel path: reads directly by classType.
+    if (req.query.classType) {
+      const teacher = await requireAdmin(req, res);
+      if (!teacher) return;
+      const classType = req.query.classType.toString().trim();
+      if (!isValidClassType(classType)) {
+        return res.status(400).json({ error: `Unknown classType: "${classType}"` });
+      }
+      return res.json(await getGameAccessRows(classType));
+    }
+
+    // Public/player path: resolves classId → classType server-side.
     const classId = await requireClass(req, res);
     if (!classId) return;
-    res.json(await getGameAccessRows(classId));
+    const classType = await classTypeForClassId(classId);
+    if (!classType) {
+      return res.status(400).json({ error: 'Class not found' });
+    }
+    res.json(await getGameAccessRows(classType));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not load game access' });
   }
 });
 
-// Saves the complete homepage game order after teacher drag-and-drop.
-// This must stay above /api/game-access/:gameKey.
+// Admin-only: saves the complete game order for a classType.
+// Must stay above /api/game-access/:gameKey.
 app.put('/api/game-access/order', async (req, res) => {
   try {
-    const { gameKeys } = req.body;
-    const teacher = await requireTeacher(req, res);
+    const { gameKeys, classType } = req.body;
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
 
-    if (!teacher) return;
+    if (!isValidClassType(classType)) {
+      return res.status(400).json({ error: `Unknown classType: "${classType}"` });
+    }
 
     const addedKeys = await GameAccess.distinct('gameKey', {
-      classId: teacher.classId,
+      classType,
       added: true,
     });
 
@@ -364,7 +438,7 @@ app.put('/api/game-access/order', async (req, res) => {
 
     if (!validList) {
       return res.status(400).json({
-        error: 'gameKeys must contain every game currently added to this class exactly once',
+        error: 'gameKeys must contain every game currently added to this class type exactly once',
       });
     }
 
@@ -373,11 +447,11 @@ app.put('/api/game-access/order', async (req, res) => {
     await GameAccess.bulkWrite(
       gameKeys.map((gameKey, order) => ({
         updateOne: {
-          filter: { classId: teacher.classId, gameKey, added: true },
+          filter: { classType, gameKey, added: true },
           update: {
             $set: {
               order,
-              updatedBy: teacher.name,
+              updatedBy: admin.name,
               updatedAt,
             },
           },
@@ -388,7 +462,7 @@ app.put('/api/game-access/order', async (req, res) => {
 
     res.json({
       ok: true,
-      rows: await getGameAccessRows(teacher.classId),
+      rows: await getGameAccessRows(classType),
     });
   } catch (err) {
     console.error(err);
@@ -396,19 +470,24 @@ app.put('/api/game-access/order', async (req, res) => {
   }
 });
 
-// Adds a game from the teacher's shop. Re-adding a removed game places it at
-// the end of the class list and starts it locked.
+// Admin-only: adds a game from the shop for a classType. Re-adding a removed
+// game places it at the end and starts it locked.
 app.post('/api/game-access/:gameKey', async (req, res) => {
   try {
     const { gameKey } = req.params;
-    const teacher = await requireTeacher(req, res);
-    if (!teacher) return;
+    const { classType } = req.body;
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
+
     if (!GAME_KEY_RE.test(gameKey)) {
       return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
     }
+    if (!isValidClassType(classType)) {
+      return res.status(400).json({ error: `Unknown classType: "${classType}"` });
+    }
 
     const lastAddedGame = await GameAccess.findOne({
-      classId: teacher.classId,
+      classType,
       added: true,
     })
       .sort({ order: -1 })
@@ -420,99 +499,97 @@ app.post('/api/game-access/:gameKey', async (req, res) => {
       : 0;
 
     await GameAccess.findOneAndUpdate(
-      // Match a previously removed record as well. Filtering on `added: true`
-      // here would upsert a duplicate classId + gameKey document instead.
-      { classId: teacher.classId, gameKey },
+      { classType, gameKey },
       {
         $set: {
           added: true,
           unlocked: false,
           shiny: false,
           order,
-          updatedBy: teacher.name,
+          updatedBy: admin.name,
           updatedAt: new Date(),
         },
-        $setOnInsert: { classId: teacher.classId },
+        $setOnInsert: { classType },
       },
       { upsert: true, new: true }
     );
 
-    res.status(201).json({ ok: true, rows: await getGameAccessRows(teacher.classId) });
+    res.status(201).json({ ok: true, rows: await getGameAccessRows(classType) });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Could not add game to class' });
+    res.status(500).json({ error: 'Could not add game to class type' });
   }
 });
 
-// Keeps a disabled record instead of deleting it, so the legacy class's
-// one-time migration never brings a teacher-removed game back.
+// Admin-only: removes a game from a classType (soft-delete — sets added:false).
 app.delete('/api/game-access/:gameKey', async (req, res) => {
   try {
     const { gameKey } = req.params;
-    const teacher = await requireTeacher(req, res);
-    if (!teacher) return;
+    const { classType } = req.body;
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
+
     if (!GAME_KEY_RE.test(gameKey)) {
       return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
     }
+    if (!isValidClassType(classType)) {
+      return res.status(400).json({ error: `Unknown classType: "${classType}"` });
+    }
 
     const doc = await GameAccess.findOneAndUpdate(
-      { classId: teacher.classId, gameKey, added: true },
+      { classType, gameKey, added: true },
       {
         $set: {
           added: false,
           unlocked: false,
           shiny: false,
-          updatedBy: teacher.name,
+          updatedBy: admin.name,
           updatedAt: new Date(),
         },
       },
       { new: true }
     );
 
-    if (!doc) return res.status(404).json({ error: 'This game is not in the class' });
-    res.json({ ok: true, rows: await getGameAccessRows(teacher.classId) });
+    if (!doc) return res.status(404).json({ error: 'This game is not in the class type' });
+    res.json({ ok: true, rows: await getGameAccessRows(classType) });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Could not remove game from class' });
+    res.status(500).json({ error: 'Could not remove game from class type' });
   }
 });
 
-// Marks one game as featured/shiny on the homepage.
-// This must also remain above /api/game-access/:gameKey.
+// Admin-only: marks one game as featured/shiny for a classType.
+// Must stay above /api/game-access/:gameKey.
 app.put('/api/game-access/:gameKey/shiny', async (req, res) => {
   try {
     const { gameKey } = req.params;
-    const { shiny } = req.body;
-
-    const teacher = await requireTeacher(req, res);
-
-    if (!teacher) return;
+    const { shiny, classType } = req.body;
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
 
     if (!GAME_KEY_RE.test(gameKey)) {
       return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
     }
-
     if (typeof shiny !== 'boolean') {
-      return res.status(400).json({
-        error: 'shiny must be true or false',
-      });
+      return res.status(400).json({ error: 'shiny must be true or false' });
+    }
+    if (!isValidClassType(classType)) {
+      return res.status(400).json({ error: `Unknown classType: "${classType}"` });
     }
 
     const doc = await GameAccess.findOneAndUpdate(
-      { classId: teacher.classId, gameKey, added: true },
+      { classType, gameKey, added: true },
       {
         $set: {
           shiny,
-          updatedBy: teacher.name,
+          updatedBy: admin.name,
           updatedAt: new Date(),
         },
       },
-      {
-        new: true,
-      }
+      { new: true }
     );
 
-    if (!doc) return res.status(404).json({ error: 'Add this game to the class first' });
+    if (!doc) return res.status(404).json({ error: 'Add this game to the class type first' });
 
     res.json({
       ok: true,
@@ -522,47 +599,41 @@ app.put('/api/game-access/:gameKey/shiny', async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: 'Could not update shiny game setting',
-    });
+    res.status(500).json({ error: 'Could not update shiny game setting' });
   }
 });
 
-// Locks or unlocks one game for players.
+// Admin-only: locks or unlocks one game for a classType.
 app.put('/api/game-access/:gameKey', async (req, res) => {
   try {
     const { gameKey } = req.params;
-    const { unlocked } = req.body;
-
-    const teacher = await requireTeacher(req, res);
-
-    if (!teacher) return;
+    const { unlocked, classType } = req.body;
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
 
     if (!GAME_KEY_RE.test(gameKey)) {
       return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
     }
-
     if (typeof unlocked !== 'boolean') {
-      return res.status(400).json({
-        error: 'unlocked must be true or false',
-      });
+      return res.status(400).json({ error: 'unlocked must be true or false' });
+    }
+    if (!isValidClassType(classType)) {
+      return res.status(400).json({ error: `Unknown classType: "${classType}"` });
     }
 
     const doc = await GameAccess.findOneAndUpdate(
-      { classId: teacher.classId, gameKey, added: true },
+      { classType, gameKey, added: true },
       {
         $set: {
           unlocked,
-          updatedBy: teacher.name,
+          updatedBy: admin.name,
           updatedAt: new Date(),
         },
       },
-      {
-        new: true,
-      }
+      { new: true }
     );
 
-    if (!doc) return res.status(404).json({ error: 'Add this game to the class first' });
+    if (!doc) return res.status(404).json({ error: 'Add this game to the class type first' });
 
     res.json({
       ok: true,
@@ -574,9 +645,7 @@ app.put('/api/game-access/:gameKey', async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      error: 'Could not update game access',
-    });
+    res.status(500).json({ error: 'Could not update game access' });
   }
 });
 
@@ -829,57 +898,116 @@ app.get('/api/leaderboard/:game', async (req, res) => {
   }
 });
 
-async function migrateLegacyClassData() {
-  // All existing documents were created for the original K1 class. This is
-  // safe to run on every boot and lets old data keep showing up immediately.
-  await Promise.all([
-    PlaySession.updateMany(
-      { classId: { $exists: false } },
-      { $set: { classId: LEGACY_CLASS_ID } }
-    ),
-    GameAccess.updateMany(
-      { classId: { $exists: false } },
-      { $set: { classId: LEGACY_CLASS_ID } }
-    ),
-  ]);
+// ---------------------------------------------------------------------------
+// One-time boot migration: GameAccess classId → classType
+// ---------------------------------------------------------------------------
+// Runs on every deploy but is idempotent — guards check for the presence of
+// the old `classId` field before acting, so re-deploys skip it harmlessly.
+// Once all existing data has been migrated, this is a no-op.
 
-  // The original K1 class had every game available before the shop existed.
-  // Mark old settings as added and create a persistent record for every
-  // legacy game once. Removed games retain an `added: false` record.
-  await GameAccess.updateMany(
-    { classId: LEGACY_CLASS_ID, added: { $exists: false } },
-    { $set: { added: true } }
+async function migrateClassTypeAndGameAccess() {
+  // Step 0 — Ensure legacy PlaySession docs have a classId.
+  await PlaySession.updateMany(
+    { classId: { $exists: false } },
+    { $set: { classId: LEGACY_CLASS_ID } }
   );
-  await GameAccess.bulkWrite(
-    GAME_KEYS.map((gameKey, order) => ({
+
+  // Step 1 — Give every existing teacher a role if they don't have one.
+  const teacherRoleResult = await Teacher.updateMany(
+    { role: { $exists: false } },
+    { $set: { role: 'admin' } }
+  );
+  if (teacherRoleResult.modifiedCount > 0) {
+    console.log(`Set role='admin' for ${teacherRoleResult.modifiedCount} teachers`);
+  }
+
+  // Step 2 — Ensure every ClassInfo has a classType (already done by the
+  // existing migrateClassTypes, but keep the guard here for clarity).
+  const classTypeResult = await ClassInfo.updateMany(
+    { classType: { $exists: false } },
+    { $set: { classType: 'k1' } }
+  );
+  if (classTypeResult.modifiedCount > 0) {
+    console.log(`Set classType='k1' for ${classTypeResult.modifiedCount} classes`);
+  }
+
+  // Step 3 — Migrate GameAccess from classId to classType.
+  // Only proceed if any GameAccess doc still has the old `classId` field.
+  const oldDocCount = await GameAccess.countDocuments({ classId: { $exists: true } });
+  if (oldDocCount === 0) {
+    // Already migrated — skip to index cleanup only.
+    await cleanupGameAccessIndexes();
+    return;
+  }
+
+  console.log(`Migrating ${oldDocCount} GameAccess docs from classId → classType…`);
+
+  // For each gameKey, prefer the row from the legacy K1 class as the source
+  // of truth for classType 'k1'. Both existing classes are K1 anyway.
+  const oldDocs = await GameAccess.find({ classId: { $exists: true } }).lean();
+
+  // Group by gameKey, prefer k12026-pny when there are duplicates.
+  const byGameKey = new Map();
+  for (const doc of oldDocs) {
+    const existing = byGameKey.get(doc.gameKey);
+    if (!existing || doc.classId === LEGACY_CLASS_ID) {
+      byGameKey.set(doc.gameKey, doc);
+    }
+  }
+
+  // Upsert one classType='k1' row per gameKey carrying over settings.
+  const upsertOps = [];
+  for (const [gameKey, doc] of byGameKey) {
+    upsertOps.push({
       updateOne: {
-        filter: { classId: LEGACY_CLASS_ID, gameKey },
+        filter: { classType: 'k1', gameKey },
         update: {
-          $setOnInsert: {
-            classId: LEGACY_CLASS_ID,
-            gameKey,
-            added: true,
-            unlocked: false,
-            shiny: false,
-            order,
+          $set: {
+            added: doc.added ?? true,
+            unlocked: doc.unlocked ?? false,
+            shiny: doc.shiny ?? false,
+            order: doc.order ?? GAME_KEYS.indexOf(gameKey),
+            updatedBy: doc.updatedBy || null,
+            updatedAt: doc.updatedAt || new Date(),
           },
+          $setOnInsert: { classType: 'k1' },
         },
         upsert: true,
       },
-    }))
-  );
+    });
+  }
 
-  // Old releases created a globally-unique gameKey index. Replace it with
-  // the classId + gameKey index declared by the model so every class can
-  // maintain its own settings.
-  try {
-    await GameAccess.collection.dropIndex('gameKey_1');
-  } catch (err) {
-    if (err.codeName !== 'IndexNotFound' && err.code !== 27) throw err;
+  if (upsertOps.length > 0) {
+    await GameAccess.bulkWrite(upsertOps);
+  }
+
+  // Remove old classId-keyed documents.
+  const deleteResult = await GameAccess.deleteMany({ classId: { $exists: true } });
+  console.log(`Deleted ${deleteResult.deletedCount} old classId-keyed GameAccess docs`);
+
+  await cleanupGameAccessIndexes();
+  console.log('GameAccess classId → classType migration complete');
+}
+
+// Drops the old {classId, gameKey} unique index if it still exists, then
+// syncs indexes so the new {classType, gameKey} index from the model takes
+// effect. Also drops any legacy gameKey-only index.
+async function cleanupGameAccessIndexes() {
+  const existingIndexes = await GameAccess.collection.indexes();
+  const indexNames = existingIndexes.map((idx) => idx.name);
+
+  for (const name of indexNames) {
+    if (name === 'classId_1_gameKey_1' || name === 'gameKey_1') {
+      try {
+        await GameAccess.collection.dropIndex(name);
+        console.log(`Dropped legacy index: ${name}`);
+      } catch (err) {
+        if (err.codeName !== 'IndexNotFound' && err.code !== 27) throw err;
+      }
+    }
   }
 
   await GameAccess.syncIndexes();
-  await PlaySession.syncIndexes();
 }
 
 // Assigns random 6-character codes to existing students that don't have one
@@ -920,25 +1048,14 @@ async function migrateStudentCodes() {
   }
 }
 
-// Ensure every ClassInfo doc has a classType (defaults to 'k1').
-async function migrateClassTypes() {
-  const result = await ClassInfo.updateMany(
-    { classType: { $exists: false } },
-    { $set: { classType: 'k1' } }
-  );
-  if (result.modifiedCount > 0) {
-    console.log(`Set classType to 'k1' for ${result.modifiedCount} classes`);
-  }
-}
-
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(async () => {
     await seedDirectoryIfEmpty();
-    await migrateLegacyClassData();
-    await migrateClassTypes();
+    await migrateClassTypeAndGameAccess();
     await migrateStudentCodes();
     await Student.syncIndexes();
+    await PlaySession.syncIndexes();
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
     });
