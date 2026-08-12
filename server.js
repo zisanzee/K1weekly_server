@@ -901,6 +901,65 @@ app.get('/api/plays', async (req, res) => {
   }
 });
 
+// Most recent Friday noon, i.e. the start of the current weekly cycle.
+// Matches the frontend's NextGameTimer: a new "week" begins every Friday
+// at 12:00. If the caller passes ?since= (ISO timestamp), that wins, so the
+// client can align the boundary to the player's local timezone.
+function weekStartFridayNoon(now = new Date()) {
+  const d = new Date(now);
+  const daysSinceFriday = (d.getDay() + 2) % 7; // Fri→0, Sat→1 … Thu→6
+  d.setDate(d.getDate() - daysSinceFriday);
+  d.setHours(12, 0, 0, 0);
+  // Before Friday noon today: the current week started last Friday.
+  if (d.getTime() > now.getTime()) {
+    d.setDate(d.getDate() - 7);
+  }
+  return d;
+}
+
+// Public weekly leaderboard — one trophy per completed play this week,
+// grouped by player. Uses the same Friday→Friday window as the frontend
+// timer. No teacher code required: this is a shared, class-level display.
+app.get('/api/leaderboard', async (req, res) => {
+  try {
+    const classId = await requireClass(req, res);
+    if (!classId) return;
+
+    let since;
+    const sinceParam = (req.query.since || '').toString().trim();
+    if (sinceParam) {
+      const parsed = new Date(sinceParam);
+      if (!Number.isNaN(parsed.getTime())) since = parsed;
+    }
+    if (!since) since = weekStartFridayNoon(new Date());
+
+    const rows = await PlaySession.aggregate([
+      { $match: { classId, completedAt: { $gte: since } } },
+      {
+        $group: {
+          _id: '$playerName',
+          trophies: { $sum: 1 },
+        },
+      },
+      { $sort: { trophies: -1, _id: 1 } },
+      {
+        $project: {
+          _id: 0,
+          playerName: '$_id',
+          trophies: 1,
+        },
+      },
+    ]);
+
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      error: 'Could not load leaderboard',
+    });
+  }
+});
+
 // Top ten runs for one game.
 app.get('/api/leaderboard/:game', async (req, res) => {
   try {

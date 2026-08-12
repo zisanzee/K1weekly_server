@@ -27,5 +27,8 @@ const playSessionSchema = new mongoose.Schema({
 });
 
 playSessionSchema.index({ classId: 1, playerName: 1, game: 1 });
+// Supports the weekly leaderboard query ({ classId, completedAt: { $gte } })
+// without scanning every session for the class.
+playSessionSchema.index({ classId: 1, completedAt: -1 });
 
 module.exports = mongoose.model('PlaySession', playSessionSchema);
