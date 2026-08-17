@@ -22,10 +22,9 @@ const {
 
 const app = express();
 
-const GAME_KEYS = ['1', '2', '3', '4', '5', '6', '7', 'b1'];
 // Accept any non-empty alphanumeric game key — adding new games to the
-// frontend catalog no longer requires a server-side edit beyond adding
-// the key to GAME_KEYS above.
+// frontend catalog requires no server-side edit at all. The GameAccess
+// collection is the source of truth for which games have been added.
 const GAME_KEY_RE = /^[a-zA-Z0-9_]+$/;
 const PORT = process.env.PORT || 4000;
 const LEGACY_CLASS_ID = 'k12026-pny';
@@ -387,23 +386,24 @@ function isValidClassType(value) {
 // Returns the game arrangement for a given classType. Uses .lean() for
 // performance — plain objects, no Mongoose document overhead.
 async function getGameAccessRows(classType) {
-  const docs = await GameAccess.find({
-    classType,
-    gameKey: { $in: GAME_KEYS },
-    added: true,
-  }).lean();
-  return docs.map((doc) => ({
-    gameKey: doc.gameKey,
-    unlocked: Boolean(doc.unlocked),
-    shiny: Boolean(doc.shiny),
-    order: Number.isInteger(doc.order) ? doc.order : GAME_KEYS.indexOf(doc.gameKey),
-    updatedBy: doc.updatedBy,
-    updatedAt: doc.updatedAt,
-  })).sort(
-    (a, b) =>
-      a.order - b.order ||
-      GAME_KEYS.indexOf(a.gameKey) - GAME_KEYS.indexOf(b.gameKey)
-  );
+  // No hardcoded game-key allowlist — the frontend GAME_CATALOG already
+  // filters to known games, and the DB is the source of truth for what has
+  // been added to a class type. New games work with zero server edits.
+  const docs = await GameAccess.find({ classType, added: true }).lean();
+  return docs
+    .map((doc) => ({
+      gameKey: doc.gameKey,
+      unlocked: Boolean(doc.unlocked),
+      shiny: Boolean(doc.shiny),
+      order: Number.isInteger(doc.order) ? doc.order : 0,
+      updatedBy: doc.updatedBy,
+      updatedAt: doc.updatedAt,
+    }))
+    .sort(
+      (a, b) =>
+        a.order - b.order ||
+        a.gameKey.localeCompare(b.gameKey, undefined, { numeric: true })
+    );
 }
 
 // Read endpoint — used by the homepage, game gates, and teacher panel.
@@ -1053,7 +1053,7 @@ async function migrateClassTypeAndGameAccess() {
             added: doc.added ?? true,
             unlocked: doc.unlocked ?? false,
             shiny: doc.shiny ?? false,
-            order: doc.order ?? GAME_KEYS.indexOf(gameKey),
+            order: doc.order ?? 0,
             updatedBy: doc.updatedBy || null,
             updatedAt: doc.updatedAt || new Date(),
           },
