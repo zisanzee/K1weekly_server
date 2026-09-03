@@ -783,33 +783,125 @@ app.delete('/api/plays', async (req, res) => {
   }
 });
 
-// Overall totals and per-game statistics.
+// ---------------------------------------------------------------------------
+// Shared list helpers for the paginated stats endpoints (/api/summary and
+// /api/plays). The teacher panel streams these as the user scrolls, so the
+// server owns filtering (game + name search), sorting, and paging instead of
+// shipping thousands of rows for the client to re-derive on every render.
+// ---------------------------------------------------------------------------
+
+const LIST_LIMIT_DEFAULT = 50;
+const LIST_LIMIT_MAX = 200;
+
+// Read-only whitelists of the sort columns each list may be ordered by — any
+// other value falls back to that list's default so a bad query can't inject
+// an arbitrary sort expression.
+const SUMMARY_SORT_KEYS = new Set(['playerName', 'game', 'bestStreak', 'lastPlayedAt']);
+const PLAYS_SORT_KEYS = new Set([
+  'playerName',
+  'game',
+  'stars',
+  'peakStreak',
+  'completedAt',
+  'deviceKind',
+]);
+
+// Escapes regex metacharacters so a teacher's free-text search is matched
+// literally, not interpreted as a pattern.
+function escapeRegex(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Parses + clamps the pagination/filter/sort query params shared by the two
+// list endpoints. Always returns a well-formed object the caller can trust.
+function parseListParams(req) {
+  const limitRaw = Number.parseInt(req.query.limit, 10);
+  const limit =
+    Number.isInteger(limitRaw) && limitRaw > 0
+      ? Math.min(limitRaw, LIST_LIMIT_MAX)
+      : LIST_LIMIT_DEFAULT;
+
+  const pageRaw = Number.parseInt(req.query.page, 10);
+  const page = Number.isInteger(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+
+  const sortDirRaw = (req.query.sortDir || '').toString().toLowerCase();
+  const sortDir = sortDirRaw === 'asc' ? 'asc' : 'desc';
+
+  const sortKey = (req.query.sortKey || '').toString().trim();
+  const game = (req.query.game || '').toString().trim();
+  const q = (req.query.q || '').toString().trim().slice(0, 60);
+
+  return { limit, page, sortDir, sortKey, game, q };
+}
+
+// Overall totals plus per-game statistics. Unlike the two list endpoints
+// this is intentionally small and loaded once: it feeds the header cards,
+// the per-game cards, and the game-filter dropdown, all of which need
+// full-class aggregates that can't be derived from a single page of rows.
 app.get('/api/stats', async (req, res) => {
   try {
     const teacher = await requireTeacher(req, res);
     if (!teacher) return;
     const match = { classId: teacher.classId };
-    const totalPlays = await PlaySession.countDocuments(match);
-    const uniquePlayers = (await PlaySession.distinct('playerName', match)).length;
 
-    const perGame = await PlaySession.aggregate([
+    // One round-trip: facet splits the matched set into the handful of
+    // aggregates the panel needs without separate scans.
+    const agg = await PlaySession.aggregate([
       { $match: match },
       {
-        $group: {
-          _id: '$game',
-          plays: { $sum: 1 },
-          avgStars: { $avg: '$stars' },
-          bestStreak: { $max: '$peakStreak' },
+        $facet: {
+          plays: [{ $count: 'n' }],
+          players: [{ $group: { _id: '$playerName' } }, { $count: 'n' }],
+          basic: [
+            {
+              $group: {
+                _id: '$game',
+                plays: { $sum: 1 },
+                avgStars: { $avg: '$stars' },
+                bestStreak: { $max: '$peakStreak' },
+                // elapsedSeconds only exists on bonus/time-trial plays and
+                // $avg ignores docs missing it, so this is the per-play
+                // average completion time for a game that has any.
+                avgElapsedSeconds: { $avg: '$elapsedSeconds' },
+              },
+            },
+          ],
+          // Distinct player count per game (the per-game "Players" card).
+          playersPerGame: [
+            { $group: { _id: { game: '$game', playerName: '$playerName' } } },
+            { $group: { _id: '$_id.game', players: { $sum: 1 } } },
+          ],
+          // Average of each player's *best* streak for a game (not the
+          // per-play average) — matches the old "per player" card label.
+          bestStreakPerPlayer: [
+            {
+              $group: {
+                _id: { game: '$game', playerName: '$playerName' },
+                best: { $max: '$peakStreak' },
+              },
+            },
+            { $group: { _id: '$_id.game', avgBestStreak: { $avg: '$best' } } },
+          ],
         },
       },
-      { $sort: { _id: 1 } },
     ]);
 
-    res.json({
-      totalPlays,
-      uniquePlayers,
-      perGame,
-    });
+    const totalPlays = agg[0]?.plays?.[0]?.n ?? 0;
+    const uniquePlayers = agg[0]?.players?.[0]?.n ?? 0;
+
+    const byGame = new Map((agg[0]?.basic ?? []).map((g) => [g._id, g]));
+    for (const g of agg[0]?.playersPerGame ?? []) {
+      if (byGame.has(g._id)) byGame.get(g._id).players = g.players;
+    }
+    for (const g of agg[0]?.bestStreakPerPlayer ?? []) {
+      if (byGame.has(g._id)) byGame.get(g._id).avgBestStreak = g.avgBestStreak;
+    }
+
+    const perGame = [...byGame.values()].sort((a, b) =>
+      String(a._id).localeCompare(String(b._id))
+    );
+
+    res.json({ totalPlays, uniquePlayers, perGame });
   } catch (err) {
     console.error(err);
     res.status(500).json({
@@ -818,7 +910,12 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-// One row per player and game.
+// One row per player and game. Two response shapes depending on who asks:
+//  - teacher code → class-wide, server-filtered/sorted/paginated object
+//    { rows, total, page, limit, hasMore } for the streaming teacher panel.
+//  - classId + playerName (single player, e.g. Home/student progress) → plain
+//    array, unchanged — one player has only a handful of game rows, so it
+//    never needs paging and Home/BetaHome keep working as-is.
 app.get('/api/summary', async (req, res) => {
   try {
     const teacher = await teacherFromRequest(req);
@@ -834,15 +931,13 @@ app.get('/api/summary', async (req, res) => {
     const match = { classId };
     if (!teacher) match.playerName = playerName;
 
-    const summary = await PlaySession.aggregate([
-      { $match: match },
+    // Shared grouping — sorted by completedAt first so $last picks the most
+    // recent play's score/rounds rather than an arbitrary one.
+    const group = [
       { $sort: { completedAt: 1 } },
       {
         $group: {
-          _id: {
-            playerName: '$playerName',
-            game: '$game',
-          },
+          _id: { playerName: '$playerName', game: '$game' },
           timesPlayed: { $sum: 1 },
           bestStars: { $max: '$stars' },
           lastStars: { $last: '$stars' },
@@ -864,15 +959,45 @@ app.get('/api/summary', async (req, res) => {
           lastPlayedAt: 1,
         },
       },
+    ];
+
+    // Single-player path: plain array, no paging.
+    if (!teacher) {
+      const rows = await PlaySession.aggregate([
+        { $match: match },
+        ...group,
+        { $sort: { game: 1 } },
+      ]);
+      return res.json(rows);
+    }
+
+    const { limit, page, sortDir, sortKey, game, q } = parseListParams(req);
+    if (game) match.game = game;
+    if (q) match.playerName = { $regex: escapeRegex(q), $options: 'i' };
+
+    const dir = sortDir === 'asc' ? 1 : -1;
+    const sortField = SUMMARY_SORT_KEYS.has(sortKey) ? sortKey : 'lastPlayedAt';
+
+    // $facet counts the total distinct player+game rows while slicing just
+    // the requested page — one scan, two results.
+    const result = await PlaySession.aggregate([
+      { $match: match },
+      ...group,
       {
-        $sort: {
-          playerName: 1,
-          game: 1,
+        $facet: {
+          meta: [{ $count: 'total' }],
+          data: [
+            { $sort: { [sortField]: dir, playerName: 1, game: 1 } },
+            { $skip: (page - 1) * limit },
+            { $limit: limit },
+          ],
         },
       },
     ]);
 
-    res.json(summary);
+    const total = result[0]?.meta?.[0]?.total ?? 0;
+    const rows = result[0]?.data ?? [];
+    res.json({ rows, total, page, limit, hasMore: page * limit < total });
   } catch (err) {
     console.error(err);
     res.status(500).json({
@@ -881,18 +1006,66 @@ app.get('/api/summary', async (req, res) => {
   }
 });
 
-// Every play session, newest first.
+// Paginated, server-filtered/sorted feed of every individual play session,
+// newest first by default. The panel streams pages as the teacher scrolls
+// instead of the old behavior of returning every session in one payload.
 app.get('/api/plays', async (req, res) => {
   try {
     const teacher = await requireTeacher(req, res);
     if (!teacher) return;
-    const plays = await PlaySession.find({ classId: teacher.classId })
-      .sort({ completedAt: -1 })
-      .select(
-        'playerName game stars totalRounds peakStreak elapsedSeconds mistakes completedAt device -_id'
-      );
 
-    res.json(plays);
+    const { limit, page, sortDir, sortKey, game, q } = parseListParams(req);
+
+    const match = { classId: teacher.classId };
+    if (game) match.game = game;
+    if (q) match.playerName = { $regex: escapeRegex(q), $options: 'i' };
+
+    const dir = sortDir === 'asc' ? 1 : -1;
+    const sortField = PLAYS_SORT_KEYS.has(sortKey) ? sortKey : 'completedAt';
+
+    // device.kind is nested and absent on pre-device-tracking plays. Project
+    // it to a top-level sortable field with a sentinel so missing values pin
+    // to the bottom in both directions (mirrors the old client comparator,
+    // which always placed unknowns last).
+    const missingDeviceSort = sortDir === 'asc' ? '\uffff' : '\u0000';
+
+    const result = await PlaySession.aggregate([
+      { $match: match },
+      {
+        $facet: {
+          meta: [{ $count: 'total' }],
+          data: [
+            {
+              $addFields: {
+                deviceKind: { $ifNull: ['$device.kind', missingDeviceSort] },
+              },
+            },
+            { $sort: { [sortField]: dir, _id: dir } },
+            { $skip: (page - 1) * limit },
+            { $limit: limit },
+            {
+              $project: {
+                _id: 0,
+                playerName: 1,
+                game: 1,
+                stars: 1,
+                totalRounds: 1,
+                peakStreak: 1,
+                elapsedSeconds: 1,
+                mistakes: 1,
+                completedAt: 1,
+                device: 1,
+              },
+            },
+          ],
+        },
+      },
+    ]);
+
+    const total = result[0]?.meta?.[0]?.total ?? 0;
+    // Strip the transient deviceKind sort helper before returning.
+    const rows = (result[0]?.data ?? []).map(({ deviceKind, ...doc }) => doc);
+    res.json({ rows, total, page, limit, hasMore: page * limit < total });
   } catch (err) {
     console.error(err);
     res.status(500).json({
