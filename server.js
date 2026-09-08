@@ -1159,6 +1159,106 @@ app.get('/api/leaderboard/:game', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Weekly mission + player summary
+// ---------------------------------------------------------------------------
+// All of this is derived from PlaySession inside the current Friday→Friday
+// window — there is no stored "weekly state" to reset, so the boundary rolls
+// over on its own exactly like the weekly champion leaderboard. The mission is
+// "play 4 different games this week"; one session = one trophy (mirrors the
+// weekly champions count), and "days learning" is derived client-side from the
+// returned play timestamps so the day boundary matches the player's timezone.
+const WEEKLY_MISSION_TARGET = 4;
+
+// ?since= (ISO) lets the client pin the boundary to its own local Friday noon;
+// when absent we fall back to the server's Friday-noon computation.
+function parseWeekSince(req) {
+  const raw = (req.query.since || '').toString().trim();
+  if (!raw) return null;
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+// A single player's activity since the last Friday, for their own home strip.
+// A child's weekly plays are small, so we ship the play list and let the
+// client derive trophies (= plays), distinct games (mission) and distinct
+// learning days from the same rows — every badge then stays in lockstep.
+app.get('/api/player/weekly', async (req, res) => {
+  try {
+    const classId = await requireClass(req, res);
+    if (!classId) return;
+
+    const playerName = (req.query.playerName || '').toString().trim();
+    if (!playerName) {
+      return res.status(400).json({ error: 'playerName is required' });
+    }
+
+    const since = parseWeekSince(req) || weekStartFridayNoon(new Date());
+
+    const plays = await PlaySession.find({
+      classId,
+      playerName,
+      completedAt: { $gte: since },
+    })
+      .select('game completedAt -_id')
+      .sort({ completedAt: 1 })
+      .lean();
+
+    res.json({
+      since: since.toISOString(),
+      target: WEEKLY_MISSION_TARGET,
+      plays,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load weekly progress' });
+  }
+});
+
+// Teacher-only: everyone in their own class who has completed this week's
+// mission (played at least 4 different games), so the stats panel can put a
+// spotlight on them. Aggregated server-side because a whole class could be
+// many sessions.
+app.get('/api/weekly-mission', async (req, res) => {
+  try {
+    const teacher = await requireTeacher(req, res);
+    if (!teacher) return;
+
+    const since = parseWeekSince(req) || weekStartFridayNoon(new Date());
+
+    const rows = await PlaySession.aggregate([
+      { $match: { classId: teacher.classId, completedAt: { $gte: since } } },
+      {
+        $group: {
+          _id: '$playerName',
+          games: { $addToSet: '$game' },
+          trophies: { $sum: 1 },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          playerName: '$_id',
+          games: 1,
+          trophies: 1,
+          distinctGames: { $size: '$games' },
+        },
+      },
+      { $match: { distinctGames: { $gte: WEEKLY_MISSION_TARGET } } },
+      { $sort: { distinctGames: -1, trophies: -1, playerName: 1 } },
+    ]);
+
+    res.json({
+      since: since.toISOString(),
+      target: WEEKLY_MISSION_TARGET,
+      completers: rows,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load weekly mission' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // One-time boot migration: GameAccess classId → classType
 // ---------------------------------------------------------------------------
 // Runs on every deploy but is idempotent — guards check for the presence of
