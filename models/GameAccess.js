@@ -24,7 +24,9 @@ const gameAccessSchema = new mongoose.Schema({
   // retained (not deleted) so a bad migration can be rolled back. They carry no
   // classId and are therefore excluded from the unique index below, which is
   // why the index is partial rather than a plain compound unique index.
-  classType: { type: String, default: null },
+  // No default — new per-class rows must OMIT this field entirely rather than
+  // store classType:null (which would have collided under the old index).
+  classType: { type: String },
 });
 
 // One row per {classId, gameKey} for live (classId-keyed) rows. The partial

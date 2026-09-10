@@ -2410,6 +2410,13 @@ async function migrateClassFields() {
 // Clones classType-keyed GameAccess rows into per-class classId rows. The old
 // classType rows are intentionally NOT deleted (kept as a rollback backup).
 async function migrateGameAccessToClassId() {
+  // CRITICAL ORDER: the legacy {classType, gameKey} unique index must be
+  // dropped BEFORE any inserts. The cloned rows carry no classType, so Mongo
+  // indexes them as classType:null — a second class's clones would then collide
+  // on {classType:null, gameKey} and abort the deploy. syncIndexes runs after
+  // the inserts to build the new partial {classId, gameKey} index instead.
+  await dropLegacyGameAccessIndexes();
+
   const classes = await ClassInfo.find().lean();
 
   for (const classroom of classes) {
@@ -2440,15 +2447,16 @@ async function migrateGameAccessToClassId() {
     console.log(`Cloned ${sourceRows.length} GameAccess rows → class ${classroom.classId}`);
   }
 
-  await cleanupGameAccessIndexes();
+  await GameAccess.syncIndexes();
 }
 
-// Drops the legacy classType-keyed unique index so the new partial
-// {classId, gameKey} index from the model can take effect.
-async function cleanupGameAccessIndexes() {
+// Drops the legacy classType-keyed unique index (and any legacy gameKey-only
+// index) so the new partial {classId, gameKey} index from the model can take
+// effect. Idempotent — a missing index is not an error.
+async function dropLegacyGameAccessIndexes() {
   const existingIndexes = await GameAccess.collection.indexes();
   for (const idx of existingIndexes) {
-    if (idx.name === 'classType_1_gameKey_1') {
+    if (idx.name === 'classType_1_gameKey_1' || idx.name === 'gameKey_1') {
       try {
         await GameAccess.collection.dropIndex(idx.name);
         console.log(`Dropped legacy index: ${idx.name}`);
@@ -2457,8 +2465,6 @@ async function cleanupGameAccessIndexes() {
       }
     }
   }
-
-  await GameAccess.syncIndexes();
 }
 
 // One-time audit: reports duplicate or cross-conflicting codes WITHOUT renaming
