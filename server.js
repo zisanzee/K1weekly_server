@@ -12,12 +12,13 @@ const GameAccess = require('./models/GameAccess');
 const Teacher = require('./models/Teacher');
 const ClassInfo = require('./models/ClassInfo');
 const Student = require('./models/Student');
+const SystemConfig = require('./models/SystemConfig');
+const PlayerMerge = require('./models/PlayerMerge');
 const {
   lookupTeacher,
   getClasses,
   isKnownClass,
   seedDirectoryIfEmpty,
-  classTypeForClassId,
 } = require('./directory');
 
 const app = express();
@@ -126,6 +127,41 @@ app.post('/api/teacher-login', async (req, res) => {
 
 app.get('/api/classes', async (req, res) => {
   try {
+    // Admin (when a credential is present) sees every class enriched with
+    // summary info; the public/player path keeps the original lightweight list
+    // (id/name/classType) so existing callers are unaffected.
+    if (req.query.teacherCode || req.body?.teacherCode) {
+      const admin = await requireAdmin(req, res);
+      if (!admin) return;
+      const classes = await ClassInfo.find().lean();
+      const rows = await Promise.all(
+        classes.map(async (classroom) => {
+          const [teacherCount, studentCount] = await Promise.all([
+            Teacher.countDocuments({
+              classId: classroom.classId,
+              active: { $ne: false },
+            }),
+            Student.countDocuments({ classId: classroom.classId }),
+          ]);
+          return {
+            id: classroom.classId,
+            classId: classroom.classId,
+            name: classroom.className,
+            className: classroom.className,
+            classAlias: classroom.classAlias || classroom.className,
+            classYear: classroom.classYear || null,
+            classCode: classroom.classCode || null,
+            classType: classroom.classType || 'k1',
+            isPublic: Boolean(classroom.isPublic),
+            active: classroom.active !== false,
+            teacherCount,
+            studentCount,
+          };
+        })
+      );
+      return res.json(rows);
+    }
+
     res.json(await getClasses());
   } catch (err) {
     console.error(err);
@@ -133,8 +169,8 @@ app.get('/api/classes', async (req, res) => {
   }
 });
 
-// Class name/image/classType plus the teachers assigned to it (derived from
-// Teacher, not stored on the class, so it can't go stale).
+// Class detail. Admin: any class. Teacher: only their own. The teacher list is
+// derived from Teacher (not stored on the class) so it can't go stale.
 app.get('/api/classes/:classId', async (req, res) => {
   try {
     const { classId } = req.params;
@@ -142,21 +178,260 @@ app.get('/api/classes/:classId', async (req, res) => {
       return res.status(404).json({ error: 'Class not found' });
     }
 
+    if (req.query.teacherCode || req.body?.teacherCode) {
+      const actor = await requireClassAccess(req, res, classId);
+      if (!actor) return;
+    }
+
     const [classInfo, teachers] = await Promise.all([
       ClassInfo.findOne({ classId }).lean(),
-      Teacher.find({ classId }).select('name -_id').lean(),
+      Teacher.find({ classId }).select('name code role active -_id').lean(),
     ]);
 
     res.json({
       classId,
       className: classInfo?.className || classId,
+      classAlias: classInfo?.classAlias || classInfo?.className || classId,
+      classYear: classInfo?.classYear || null,
+      classCode: classInfo?.classCode || null,
       classType: classInfo?.classType || 'k1',
+      isPublic: Boolean(classInfo?.isPublic),
+      active: classInfo?.active !== false,
       image: classInfo?.image || null,
       teachers: teachers.map((teacher) => teacher.name),
+      teacherList: teachers.map((teacher) => ({
+        name: teacher.name,
+        code: teacher.code,
+        role: teacher.role || 'teacher',
+        active: teacher.active !== false,
+      })),
     });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not load class information' });
+  }
+});
+
+// Admin-only: create a class plus its initial teacher list. New classes default
+// to Private unless the admin opts into Public at creation time.
+app.post('/api/classes', async (req, res) => {
+  try {
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
+
+    const className = (req.body.className || '').toString().trim().slice(0, 80);
+    const classYear = (req.body.classYear || '').toString().trim().slice(0, 20) || null;
+    const classAlias =
+      (req.body.classAlias || '').toString().trim().slice(0, 80) || className;
+    const classCode = (req.body.classCode || '').toString().trim();
+    const isPublic = req.body.isPublic === true;
+    const classId =
+      (req.body.classId || '').toString().trim() || `cls${Date.now().toString(36)}`;
+
+    if (!className) return res.status(400).json({ error: 'className is required' });
+    if (!classCode) return res.status(400).json({ error: 'classCode is required' });
+    if (await ClassInfo.exists({ classId })) {
+      return res.status(409).json({ error: 'That class id already exists' });
+    }
+
+    const conflict = await findCodeOwner(classCode);
+    if (conflict) {
+      return res
+        .status(409)
+        .json({ error: 'That class code is already taken', reason: conflict });
+    }
+
+    // Validate the whole teacher list up-front so a create can't half-succeed.
+    const teacherInput = Array.isArray(req.body.teachers) ? req.body.teachers : [];
+    const normalizedTeachers = [];
+    for (const t of teacherInput) {
+      const name = (t.name || '').toString().trim().slice(0, 80);
+      const code = (t.teacherCode || t.code || '').toString().trim();
+      if (!name || !code) {
+        return res.status(400).json({ error: 'Each teacher needs a name and a code' });
+      }
+      const teacherConflict = await findCodeOwner(code);
+      if (teacherConflict) {
+        return res
+          .status(409)
+          .json({ error: `Teacher code "${code}" is already taken`, reason: teacherConflict });
+      }
+      normalizedTeachers.push({ name, code });
+    }
+    const codeSet = new Set(normalizedTeachers.map((t) => t.code));
+    if (codeSet.size !== normalizedTeachers.length) {
+      return res.status(409).json({ error: 'Duplicate teacher codes in the request' });
+    }
+
+    await ClassInfo.create({
+      classId,
+      className,
+      classAlias,
+      classYear,
+      classCode,
+      isPublic,
+      active: true,
+    });
+
+    if (normalizedTeachers.length > 0) {
+      await Teacher.insertMany(
+        normalizedTeachers.map((t) => ({
+          code: t.code,
+          name: t.name,
+          classId,
+          role: 'teacher',
+        }))
+      );
+    }
+
+    res.status(201).json({ ok: true, classId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not create class' });
+  }
+});
+
+// Admin-only: update any class field, including its full teacher list. Teachers
+// dropped from the list are soft-deactivated (never deleted) so historical
+// stats rows that reference them keep resolving.
+app.put('/api/classes/:classId', async (req, res) => {
+  try {
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
+
+    const { classId } = req.params;
+    const classInfo = await ClassInfo.findOne({ classId });
+    if (!classInfo) return res.status(404).json({ error: 'Class not found' });
+
+    if ('classAlias' in req.body) {
+      classInfo.classAlias =
+        (req.body.classAlias || '').toString().trim().slice(0, 80) ||
+        classInfo.classAlias ||
+        classInfo.className;
+    }
+    if ('classYear' in req.body) {
+      classInfo.classYear =
+        (req.body.classYear || '').toString().trim().slice(0, 20) || null;
+    }
+    if ('isPublic' in req.body) classInfo.isPublic = req.body.isPublic === true;
+    if ('active' in req.body) classInfo.active = req.body.active !== false;
+    if ('image' in req.body) classInfo.image = req.body.image || null;
+
+    if ('classCode' in req.body) {
+      const classCode = (req.body.classCode || '').toString().trim();
+      if (!classCode) return res.status(400).json({ error: 'classCode cannot be empty' });
+      const conflict = await findCodeOwner(classCode, { classId });
+      if (conflict) {
+        return res
+          .status(409)
+          .json({ error: 'That class code is already taken', reason: conflict });
+      }
+      classInfo.classCode = classCode;
+    }
+    if ('className' in req.body) {
+      classInfo.className = (req.body.className || '').toString().trim().slice(0, 80);
+    }
+
+    await classInfo.save();
+
+    // Optional full teacher-list replacement. Each entry: { name, code }.
+    if (Array.isArray(req.body.teachers)) {
+      const existing = await Teacher.find({ classId });
+      const byCode = new Map(existing.map((t) => [t.code, t]));
+      const keepCodes = new Set();
+
+      for (const t of req.body.teachers) {
+        const name = (t.name || '').toString().trim().slice(0, 80);
+        const code = (t.teacherCode || t.code || '').toString().trim();
+        if (!name || !code) {
+          return res.status(400).json({ error: 'Each teacher needs a name and a code' });
+        }
+        const existingTeacher = byCode.get(code);
+        const conflict = await findCodeOwner(code, {
+          teacherId: existingTeacher?._id,
+        });
+        if (conflict) {
+          return res
+            .status(409)
+            .json({ error: `Teacher code "${code}" is already taken`, reason: conflict });
+        }
+        keepCodes.add(code);
+        if (existingTeacher) {
+          existingTeacher.name = name;
+          existingTeacher.active = true;
+          await existingTeacher.save();
+        } else {
+          await Teacher.create({ code, name, classId, role: 'teacher' });
+        }
+      }
+
+      await Teacher.updateMany(
+        { classId, code: { $nin: [...keepCodes] } },
+        { $set: { active: false } }
+      );
+    }
+
+    res.json({ ok: true, classInfo: classInfoPayload(classInfo) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not update class' });
+  }
+});
+
+// Admin OR own-class teacher: flip just the public/private flag.
+app.patch('/api/classes/:classId/public', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    if (typeof req.body.isPublic !== 'boolean') {
+      return res.status(400).json({ error: 'isPublic must be true or false' });
+    }
+
+    const classInfo = await ClassInfo.findOneAndUpdate(
+      { classId },
+      { $set: { isPublic: req.body.isPublic } },
+      { new: true }
+    ).lean();
+    if (!classInfo) return res.status(404).json({ error: 'Class not found' });
+
+    res.json({ ok: true, classInfo: classInfoPayload(classInfo) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not update class privacy' });
+  }
+});
+
+// Teacher (own class) OR admin: rename the class code, but only to a code that
+// is free in the whole namespace (Q5: teacher-editable, subject to uniqueness).
+app.patch('/api/classes/:classId/code', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    const classCode = (req.body.classCode || '').toString().trim();
+    if (!classCode) return res.status(400).json({ error: 'classCode is required' });
+
+    const conflict = await findCodeOwner(classCode, { classId });
+    if (conflict) {
+      return res
+        .status(409)
+        .json({ error: 'That class code is already taken', reason: conflict });
+    }
+
+    const classInfo = await ClassInfo.findOneAndUpdate(
+      { classId },
+      { $set: { classCode } },
+      { new: true }
+    ).lean();
+    if (!classInfo) return res.status(404).json({ error: 'Class not found' });
+
+    res.json({ ok: true, classInfo: classInfoPayload(classInfo) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not update class code' });
   }
 });
 
@@ -287,6 +562,380 @@ app.delete('/api/students/:studentId', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Class-scoped students + player-identity merge. Admin may target any class;
+// a teacher only their own. The legacy /api/students routes above stay intact
+// for backward compatibility, but the redesigned panel uses these.
+// ---------------------------------------------------------------------------
+
+// The merge UI's source list: roster students UNION the distinct playerNames
+// seen in play sessions, so name-only "light" kids (no Student record) can be
+// merged too. Merged-away roster students are excluded from the primary list.
+app.get('/api/classes/:classId/identities', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    const [students, names] = await Promise.all([
+      Student.find({ classId, mergedInto: null })
+        .select('studentId nickname fullName code -_id')
+        .lean(),
+      PlaySession.distinct('playerName', { classId }),
+    ]);
+
+    const byName = new Map();
+    for (const s of students) {
+      const name = s.nickname || s.fullName;
+      byName.set(name, {
+        name,
+        studentId: s.studentId,
+        code: s.code || null,
+        rostered: true,
+      });
+    }
+    for (const name of names) {
+      if (!name || byName.has(name)) continue;
+      byName.set(name, { name, studentId: null, code: null, rostered: false });
+    }
+
+    const merges = await PlayerMerge.find({ classId, active: true }).lean();
+    res.json({ identities: [...byName.values()], merges });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load player identities' });
+  }
+});
+
+app.get('/api/classes/:classId/students', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    const students = await Student.find({ classId })
+      .sort({ createdAt: 1 })
+      .select('studentId fullName nickname group code mergedInto mergedAt -_id')
+      .lean();
+
+    res.json(
+      students.map((s) => ({
+        ...s,
+        mergedInto: s.mergedInto ? String(s.mergedInto) : null,
+      }))
+    );
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load students' });
+  }
+});
+
+app.post('/api/classes/:classId/students', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    const nickname = (req.body.nickname || '').toString().trim().slice(0, 40);
+    const fullName =
+      (req.body.fullName || nickname || '').toString().trim().slice(0, 80);
+    const group = (req.body.group || '').toString().trim().slice(0, 40);
+    const code = (req.body.code || '').toString().trim().toUpperCase();
+
+    if (!nickname) return res.status(400).json({ error: 'nickname is required' });
+    if (!code || code.length !== 6) {
+      return res.status(400).json({ error: 'A 6-character student code is required' });
+    }
+
+    const conflict = await findCodeOwner(code);
+    if (conflict) {
+      return res
+        .status(409)
+        .json({ error: 'This code is already in use. Please try again.', reason: conflict });
+    }
+
+    const student = await Student.create({ classId, fullName, nickname, group, code });
+
+    res.status(201).json({
+      studentId: student.studentId,
+      fullName: student.fullName,
+      nickname: student.nickname,
+      group: student.group,
+      code: student.code,
+      mergedInto: null,
+      mergedAt: null,
+    });
+  } catch (err) {
+    console.error(err);
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'This code is already in use. Please try again.' });
+    }
+    res.status(500).json({ error: 'Could not add student' });
+  }
+});
+
+app.put('/api/classes/:classId/students/:studentId', async (req, res) => {
+  try {
+    const { classId, studentId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    const set = {};
+    if ('nickname' in req.body) {
+      const nickname = (req.body.nickname || '').toString().trim().slice(0, 40);
+      if (!nickname) return res.status(400).json({ error: 'nickname is required' });
+      set.nickname = nickname;
+    }
+    if ('fullName' in req.body) {
+      set.fullName = (req.body.fullName || '').toString().trim().slice(0, 80);
+    }
+    if ('group' in req.body) {
+      set.group = (req.body.group || '').toString().trim().slice(0, 40);
+    }
+    if ('code' in req.body) {
+      const code = (req.body.code || '').toString().trim().toUpperCase();
+      if (!code || code.length !== 6) {
+        return res.status(400).json({ error: 'A 6-character student code is required' });
+      }
+      const conflict = await findCodeOwner(code, { studentId });
+      if (conflict) {
+        return res
+          .status(409)
+          .json({ error: 'This code is already in use. Please try again.', reason: conflict });
+      }
+      set.code = code;
+    }
+
+    const student = await Student.findOneAndUpdate(
+      { studentId, classId },
+      { $set: set },
+      { new: true }
+    ).lean();
+    if (!student) return res.status(404).json({ error: 'Student not found in this class' });
+
+    res.json({
+      studentId: student.studentId,
+      fullName: student.fullName,
+      nickname: student.nickname,
+      group: student.group,
+      code: student.code,
+      mergedInto: student.mergedInto ? String(student.mergedInto) : null,
+      mergedAt: student.mergedAt || null,
+    });
+  } catch (err) {
+    console.error(err);
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'This code is already in use. Please try again.' });
+    }
+    res.status(500).json({ error: 'Could not update student' });
+  }
+});
+
+app.delete('/api/classes/:classId/students/:studentId', async (req, res) => {
+  try {
+    const { classId, studentId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    const result = await Student.deleteOne({ studentId, classId });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: 'Student not found in this class' });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not delete student' });
+  }
+});
+
+// Merge 2+ name-identities within one class into a primary. Light public-class
+// kids only ever gave a name, so merges are name-based (roster students fold in
+// when their name matches). Sessions are physically retagged to the primary
+// name while remembering their pre-merge name in `mergedFrom`, so unmerge can
+// restore them exactly.
+app.post('/api/classes/:classId/students/merge', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    let primaryName = (req.body.primaryName || '').toString().trim();
+    let memberNames = Array.isArray(req.body.memberNames)
+      ? req.body.memberNames.map((n) => n.toString().trim()).filter(Boolean)
+      : [];
+
+    // Also accept roster-id selections from the Students tab and map them to
+    // names, since the merge itself is name-based.
+    const mergedIds = Array.isArray(req.body.mergedStudentIds)
+      ? req.body.mergedStudentIds
+      : [];
+    const idList = [req.body.primaryStudentId, ...mergedIds]
+      .filter(Boolean)
+      .map(String);
+    if (idList.length > 0) {
+      const docs = await Student.find({ classId, studentId: { $in: idList } }).lean();
+      const byId = new Map(docs.map((d) => [d.studentId, d]));
+      if (req.body.primaryStudentId) {
+        const p = byId.get(String(req.body.primaryStudentId));
+        if (p) primaryName = p.nickname || p.fullName;
+      }
+      for (const id of mergedIds) {
+        const m = byId.get(String(id));
+        if (m) memberNames.push(m.nickname || m.fullName);
+      }
+    }
+
+    primaryName = primaryName.trim();
+    memberNames = [...new Set(memberNames.filter((n) => n && n !== primaryName))];
+
+    if (!primaryName) {
+      return res.status(400).json({ error: 'A primary name is required' });
+    }
+    if (memberNames.length === 0) {
+      return res.status(400).json({ error: 'Select at least one other identity to merge' });
+    }
+
+    // Enforce LIFO chains: a member that is itself the primary of an active
+    // merge must be unmerged first, so restoring stays unambiguous.
+    const blocking = await PlayerMerge.findOne({
+      classId,
+      active: true,
+      primaryName: { $in: memberNames },
+    }).lean();
+    if (blocking) {
+      return res.status(409).json({
+        error: `"${blocking.primaryName}" is itself a merge target — unmerge it first`,
+      });
+    }
+
+    const now = new Date();
+
+    // Retag every session carrying a member name. Sessions already tagged by an
+    // earlier merge keep their original mergedFrom value.
+    for (const member of memberNames) {
+      await PlaySession.updateMany({ classId, playerName: member }, [
+        {
+          $set: {
+            playerName: primaryName,
+            mergedFrom: { $ifNull: ['$mergedFrom', '$playerName'] },
+          },
+        },
+      ]);
+    }
+
+    // Fold matching roster students into the primary roster record when one
+    // exists, so student-code logins also resolve to the primary.
+    const rosterByName = await Student.find({
+      classId,
+      $or: [{ nickname: { $in: memberNames } }, { fullName: { $in: memberNames } }],
+    }).lean();
+    const primaryRoster = await Student.findOne({
+      classId,
+      $or: [{ nickname: primaryName }, { fullName: primaryName }],
+    }).lean();
+
+    if (primaryRoster && rosterByName.length > 0) {
+      await Student.updateMany(
+        { _id: { $in: rosterByName.map((s) => s._id) } },
+        { $set: { mergedInto: primaryRoster._id, mergedAt: now, mergedBy: actor.name } }
+      );
+      await PlaySession.updateMany(
+        { classId, studentId: { $in: rosterByName.map((s) => s.studentId) } },
+        { $set: { studentId: primaryRoster.studentId } }
+      );
+    }
+
+    await PlayerMerge.create({
+      classId,
+      primaryName,
+      members: memberNames,
+      createdBy: actor.name,
+      createdAt: now,
+      active: true,
+    });
+
+    res.json({ ok: true, primaryName, merged: memberNames });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not merge students' });
+  }
+});
+
+// Undo a single merge link. Accepts either a real studentId (roster student) or
+// the literal "name" with body.memberName for a light, record-less identity.
+app.post('/api/classes/:classId/students/:studentId/unmerge', async (req, res) => {
+  try {
+    const { classId, studentId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    let memberName = (req.body.memberName || '').toString().trim();
+    let rosterStudent = null;
+    if (studentId && studentId !== 'name') {
+      rosterStudent = await Student.findOne({ classId, studentId }).lean();
+      if (rosterStudent) memberName = rosterStudent.nickname || rosterStudent.fullName;
+    }
+    // The panel identifies record-less "light" names by name alone, but a merge
+    // may also have folded in a roster student of that name. Resolve it so
+    // unmerge clears its Student.mergedInto link too, not just the retagged
+    // sessions — otherwise the roster record stays stuck as merged.
+    if (!rosterStudent && memberName) {
+      rosterStudent = await Student.findOne({
+        classId,
+        $or: [{ nickname: memberName }, { fullName: memberName }],
+      }).lean();
+    }
+    if (!memberName) {
+      return res.status(400).json({ error: 'A member name is required to unmerge' });
+    }
+
+    const merge = await PlayerMerge.findOne({ classId, active: true, members: memberName });
+    if (!merge) {
+      return res.status(404).json({ error: 'No active merge found for that identity' });
+    }
+    const primaryName = merge.primaryName;
+
+    // Guard against LIFO violations: this member must not itself be a primary.
+    const nested = await PlayerMerge.findOne({ classId, active: true, primaryName: memberName }).lean();
+    if (nested) {
+      return res.status(409).json({
+        error: `Unmerge "${nested.primaryName}"'s own members before undoing this one`,
+      });
+    }
+
+    // Restore the retagged sessions to their exact pre-merge name.
+    await PlaySession.updateMany(
+      { classId, playerName: primaryName, mergedFrom: memberName },
+      [{ $set: { playerName: '$mergedFrom', mergedFrom: null } }]
+    );
+
+    // Restore the roster record and its session tags, if it was folded in.
+    const primaryRoster = await Student.findOne({
+      classId,
+      $or: [{ nickname: primaryName }, { fullName: primaryName }],
+    }).lean();
+    if (rosterStudent && primaryRoster) {
+      await PlaySession.updateMany(
+        { classId, studentId: primaryRoster.studentId, playerName: memberName },
+        { $set: { studentId: rosterStudent.studentId } }
+      );
+      await Student.updateOne(
+        { _id: rosterStudent._id },
+        { $set: { mergedInto: null, mergedAt: null, mergedBy: null } }
+      );
+    }
+
+    merge.members = merge.members.filter((m) => m !== memberName);
+    if (merge.members.length === 0) merge.active = false;
+    await merge.save();
+
+    res.json({ ok: true, memberName, primaryName });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not unmerge student' });
+  }
+});
+
 // Public — validates a student login code and returns the student's info
 // plus their class details so the frontend can auto-log them in.
 app.get('/api/student-login/:code', async (req, res) => {
@@ -327,22 +976,6 @@ async function classIdFromRequest(req) {
   return (await isKnownClass(classId)) ? classId : null;
 }
 
-// In-memory cache: classId → classType. These mappings never change during
-// a server's lifetime (changing a class's type requires a redeploy or an
-// admin endpoint that clears the cache), so the cache lives for the entire
-// process. Eliminates a redundant ClassInfo query on every game-access read.
-const classTypeCache = new Map();
-
-async function resolveClassType(classId) {
-  const cached = classTypeCache.get(classId);
-  if (cached !== undefined) return cached;
-
-  const doc = await ClassInfo.findOne({ classId }).select('classType -_id').lean();
-  const classType = doc?.classType || null;
-  classTypeCache.set(classId, classType);
-  return classType;
-}
-
 async function teacherFromRequest(req) {
   return lookupTeacher(req.query.teacherCode || req.body?.teacherCode);
 }
@@ -378,18 +1011,13 @@ async function requireClass(req, res) {
   return classId;
 }
 
-// Validates that a classType string is one of the known enum values.
-function isValidClassType(value) {
-  return value === 'k1' || value === 'k2';
-}
-
-// Returns the game arrangement for a given classType. Uses .lean() for
+// Returns the game arrangement for a given classId. Uses .lean() for
 // performance — plain objects, no Mongoose document overhead.
-async function getGameAccessRows(classType) {
+async function getGameAccessRows(classId) {
   // No hardcoded game-key allowlist — the frontend GAME_CATALOG already
   // filters to known games, and the DB is the source of truth for what has
-  // been added to a class type. New games work with zero server edits.
-  const docs = await GameAccess.find({ classType, added: true }).lean();
+  // been added to a class. New games work with zero server edits.
+  const docs = await GameAccess.find({ classId, added: true }).lean();
   return docs
     .map((doc) => ({
       gameKey: doc.gameKey,
@@ -406,55 +1034,129 @@ async function getGameAccessRows(classType) {
     );
 }
 
-// Read endpoint — used by the homepage, game gates, and teacher panel.
-// Accepts ?classId= (resolves to classType server-side — contract unchanged)
-// OR ?classType= + teacherCode for admin panel reads. The response shape is
-// identical either way.
+// Admins may act on any class; a teacher only on their own. Used by the
+// class-scoped game-access, student, and merge write endpoints.
+async function requireClassAccess(req, res, classId) {
+  const actor = await requireTeacher(req, res);
+  if (!actor) return null;
+  if (actor.role === 'admin') return actor;
+  if (actor.classId !== classId) {
+    res.status(403).json({ error: 'You can only manage your own class' });
+    return null;
+  }
+  return actor;
+}
+
+// ---------------------------------------------------------------------------
+// Global code namespace
+// ---------------------------------------------------------------------------
+// Teacher, class, student and admin codes all share ONE namespace: a code in
+// any bucket must never equal a code in another bucket, and duplicates within
+// a bucket are rejected by each collection's own unique index. MongoDB cannot
+// enforce uniqueness across collections, so every create/update that changes a
+// code must call findCodeOwner() and reject when it returns a reason.
+const ADMIN_CODE = 'ezadmin12/10/22';
+const ADMIN_NAME = 'Admin';
+
+// Returns a conflict reason string when `code` is already taken, or null when
+// it's free. `exclude` lets an edit re-save its own code without tripping a
+// false self-conflict.
+async function findCodeOwner(code, exclude = {}) {
+  const normalized = (code || '').toString().trim();
+  if (!normalized) return null;
+
+  const [teacher, classroom, student] = await Promise.all([
+    Teacher.findOne({
+      code: normalized,
+      ...(exclude.teacherId ? { _id: { $ne: exclude.teacherId } } : {}),
+    })
+      .select('_id')
+      .lean(),
+    ClassInfo.findOne({
+      classCode: normalized,
+      ...(exclude.classId ? { classId: { $ne: exclude.classId } } : {}),
+    })
+      .select('_id')
+      .lean(),
+    Student.findOne({
+      code: normalized.toUpperCase(),
+      ...(exclude.studentId ? { studentId: { $ne: exclude.studentId } } : {}),
+    })
+      .select('_id')
+      .lean(),
+  ]);
+
+  // The admin code is itself a Teacher document, so it's checked first to give
+  // callers a distinct 'conflicts-with-admin' reason rather than 'duplicate-teacher'.
+  if (normalized === ADMIN_CODE) {
+    const isSelf =
+      exclude.teacherId &&
+      teacher &&
+      String(teacher._id) === String(exclude.teacherId);
+    return isSelf ? null : 'conflicts-with-admin';
+  }
+  if (teacher) return 'duplicate-teacher';
+  if (classroom) return 'duplicate-class';
+  if (student) return 'duplicate-student';
+  return null;
+}
+
+// Generates a short uppercase class code that doesn't collide with anything in
+// the namespace. Used only to backfill legacy classes that lack a classCode.
+async function generateClassCode() {
+  const CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  for (let attempt = 0; attempt < 20; attempt++) {
+    let code = 'C';
+    for (let i = 0; i < 5; i++) {
+      code += CHARS[Math.floor(Math.random() * CHARS.length)];
+    }
+    if (!(await findCodeOwner(code))) return code;
+  }
+  // Extremely unlikely — fall back to a timestamp-suffixed code.
+  return `C${Date.now().toString(36).toUpperCase()}`;
+}
+
+// Read endpoint — used by the homepage, game gates, and the teacher/admin
+// panel. Reads by classId. Players omit teacherCode; the panel supplies it and
+// we then require admin-or-owner so a teacher can only read their own class.
 app.get('/api/game-access', async (req, res) => {
   try {
-    // Admin panel path: reads directly by classType.
-    if (req.query.classType) {
-      const teacher = await requireAdmin(req, res);
-      if (!teacher) return;
-      const classType = req.query.classType.toString().trim();
-      if (!isValidClassType(classType)) {
-        return res.status(400).json({ error: `Unknown classType: "${classType}"` });
-      }
-      return res.json(await getGameAccessRows(classType));
-    }
-
-    // Public/player path: resolves classId → classType server-side.
-    // Uses an in-memory cache — a single ClassInfo lookup on first access,
-    // zero DB queries on subsequent requests for the same classId.
-    const rawId = (req.query.classId || '').toString().trim();
-    if (!rawId) {
+    const classId = (req.query.classId || '').toString().trim();
+    if (!classId) {
       return res.status(400).json({ error: 'A valid classId is required' });
     }
-    const classType = await resolveClassType(rawId);
-    if (!classType) {
+    if (!(await isKnownClass(classId))) {
       return res.status(400).json({ error: 'Class not found' });
     }
-    res.json(await getGameAccessRows(classType));
+
+    // Only enforce ownership when a credential is actually presented, so the
+    // public player read path stays credential-free.
+    if (req.query.teacherCode || req.body?.teacherCode) {
+      const actor = await requireClassAccess(req, res, classId);
+      if (!actor) return;
+    }
+
+    res.json(await getGameAccessRows(classId));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not load game access' });
   }
 });
 
-// Admin-only: saves the complete game order for a classType.
+// Admin OR own-class teacher: saves the complete game order for a classId.
 // Must stay above /api/game-access/:gameKey.
 app.put('/api/game-access/order', async (req, res) => {
   try {
-    const { gameKeys, classType } = req.body;
-    const admin = await requireAdmin(req, res);
-    if (!admin) return;
-
-    if (!isValidClassType(classType)) {
-      return res.status(400).json({ error: `Unknown classType: "${classType}"` });
+    const { gameKeys } = req.body;
+    const classId = (req.body.classId || '').toString().trim();
+    if (!classId) {
+      return res.status(400).json({ error: 'A valid classId is required' });
     }
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
 
     const addedKeys = await GameAccess.distinct('gameKey', {
-      classType,
+      classId,
       added: true,
     });
 
@@ -466,7 +1168,7 @@ app.put('/api/game-access/order', async (req, res) => {
 
     if (!validList) {
       return res.status(400).json({
-        error: 'gameKeys must contain every game currently added to this class type exactly once',
+        error: 'gameKeys must contain every game currently added to this class exactly once',
       });
     }
 
@@ -475,11 +1177,11 @@ app.put('/api/game-access/order', async (req, res) => {
     await GameAccess.bulkWrite(
       gameKeys.map((gameKey, order) => ({
         updateOne: {
-          filter: { classType, gameKey, added: true },
+          filter: { classId, gameKey, added: true },
           update: {
             $set: {
               order,
-              updatedBy: admin.name,
+              updatedBy: actor.name,
               updatedAt,
             },
           },
@@ -490,7 +1192,7 @@ app.put('/api/game-access/order', async (req, res) => {
 
     res.json({
       ok: true,
-      rows: await getGameAccessRows(classType),
+      rows: await getGameAccessRows(classId),
     });
   } catch (err) {
     console.error(err);
@@ -498,24 +1200,24 @@ app.put('/api/game-access/order', async (req, res) => {
   }
 });
 
-// Admin-only: adds a game from the shop for a classType. Re-adding a removed
-// game places it at the end and starts it locked.
+// Admin OR own-class teacher: adds a game from the shop for a class. Re-adding
+// a removed game places it at the end and starts it locked.
 app.post('/api/game-access/:gameKey', async (req, res) => {
   try {
     const { gameKey } = req.params;
-    const { classType } = req.body;
-    const admin = await requireAdmin(req, res);
-    if (!admin) return;
+    const classId = (req.body.classId || '').toString().trim();
+    if (!classId) {
+      return res.status(400).json({ error: 'A valid classId is required' });
+    }
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
 
     if (!GAME_KEY_RE.test(gameKey)) {
       return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
     }
-    if (!isValidClassType(classType)) {
-      return res.status(400).json({ error: `Unknown classType: "${classType}"` });
-    }
 
     const lastAddedGame = await GameAccess.findOne({
-      classType,
+      classId,
       added: true,
     })
       .sort({ order: -1 })
@@ -527,73 +1229,78 @@ app.post('/api/game-access/:gameKey', async (req, res) => {
       : 0;
 
     await GameAccess.findOneAndUpdate(
-      { classType, gameKey },
+      { classId, gameKey },
       {
         $set: {
           added: true,
           unlocked: false,
           shiny: false,
           order,
-          updatedBy: admin.name,
+          updatedBy: actor.name,
           updatedAt: new Date(),
         },
-        $setOnInsert: { classType },
+        $setOnInsert: { classId },
       },
       { upsert: true, new: true }
     );
 
-    res.status(201).json({ ok: true, rows: await getGameAccessRows(classType) });
+    res.status(201).json({ ok: true, rows: await getGameAccessRows(classId) });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Could not add game to class type' });
+    res.status(500).json({ error: 'Could not add game to class' });
   }
 });
 
-// Admin-only: removes a game from a classType (soft-delete — sets added:false).
+// Admin OR own-class teacher: removes a game from a class (soft-delete —
+// sets added:false).
 app.delete('/api/game-access/:gameKey', async (req, res) => {
   try {
     const { gameKey } = req.params;
-    const { classType } = req.body;
-    const admin = await requireAdmin(req, res);
-    if (!admin) return;
+    const classId = (req.body.classId || '').toString().trim();
+    if (!classId) {
+      return res.status(400).json({ error: 'A valid classId is required' });
+    }
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
 
     if (!GAME_KEY_RE.test(gameKey)) {
       return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
     }
-    if (!isValidClassType(classType)) {
-      return res.status(400).json({ error: `Unknown classType: "${classType}"` });
-    }
 
     const doc = await GameAccess.findOneAndUpdate(
-      { classType, gameKey, added: true },
+      { classId, gameKey, added: true },
       {
         $set: {
           added: false,
           unlocked: false,
           shiny: false,
-          updatedBy: admin.name,
+          updatedBy: actor.name,
           updatedAt: new Date(),
         },
       },
       { new: true }
     );
 
-    if (!doc) return res.status(404).json({ error: 'This game is not in the class type' });
-    res.json({ ok: true, rows: await getGameAccessRows(classType) });
+    if (!doc) return res.status(404).json({ error: 'This game is not in the class' });
+    res.json({ ok: true, rows: await getGameAccessRows(classId) });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Could not remove game from class type' });
+    res.status(500).json({ error: 'Could not remove game from class' });
   }
 });
 
-// Admin-only: marks one game as featured/shiny for a classType.
+// Admin OR own-class teacher: marks one game as featured/shiny.
 // Must stay above /api/game-access/:gameKey.
 app.put('/api/game-access/:gameKey/shiny', async (req, res) => {
   try {
     const { gameKey } = req.params;
-    const { shiny, classType } = req.body;
-    const admin = await requireAdmin(req, res);
-    if (!admin) return;
+    const { shiny } = req.body;
+    const classId = (req.body.classId || '').toString().trim();
+    if (!classId) {
+      return res.status(400).json({ error: 'A valid classId is required' });
+    }
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
 
     if (!GAME_KEY_RE.test(gameKey)) {
       return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
@@ -601,23 +1308,20 @@ app.put('/api/game-access/:gameKey/shiny', async (req, res) => {
     if (typeof shiny !== 'boolean') {
       return res.status(400).json({ error: 'shiny must be true or false' });
     }
-    if (!isValidClassType(classType)) {
-      return res.status(400).json({ error: `Unknown classType: "${classType}"` });
-    }
 
     const doc = await GameAccess.findOneAndUpdate(
-      { classType, gameKey, added: true },
+      { classId, gameKey, added: true },
       {
         $set: {
           shiny,
-          updatedBy: admin.name,
+          updatedBy: actor.name,
           updatedAt: new Date(),
         },
       },
       { new: true }
     );
 
-    if (!doc) return res.status(404).json({ error: 'Add this game to the class type first' });
+    if (!doc) return res.status(404).json({ error: 'Add this game to the class first' });
 
     res.json({
       ok: true,
@@ -631,13 +1335,17 @@ app.put('/api/game-access/:gameKey/shiny', async (req, res) => {
   }
 });
 
-// Admin-only: locks or unlocks one game for a classType.
+// Admin OR own-class teacher: locks or unlocks one game for a class.
 app.put('/api/game-access/:gameKey', async (req, res) => {
   try {
     const { gameKey } = req.params;
-    const { unlocked, classType } = req.body;
-    const admin = await requireAdmin(req, res);
-    if (!admin) return;
+    const { unlocked } = req.body;
+    const classId = (req.body.classId || '').toString().trim();
+    if (!classId) {
+      return res.status(400).json({ error: 'A valid classId is required' });
+    }
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
 
     if (!GAME_KEY_RE.test(gameKey)) {
       return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
@@ -645,23 +1353,20 @@ app.put('/api/game-access/:gameKey', async (req, res) => {
     if (typeof unlocked !== 'boolean') {
       return res.status(400).json({ error: 'unlocked must be true or false' });
     }
-    if (!isValidClassType(classType)) {
-      return res.status(400).json({ error: `Unknown classType: "${classType}"` });
-    }
 
     const doc = await GameAccess.findOneAndUpdate(
-      { classType, gameKey, added: true },
+      { classId, gameKey, added: true },
       {
         $set: {
           unlocked,
-          updatedBy: admin.name,
+          updatedBy: actor.name,
           updatedAt: new Date(),
         },
       },
       { new: true }
     );
 
-    if (!doc) return res.status(404).json({ error: 'Add this game to the class type first' });
+    if (!doc) return res.status(404).json({ error: 'Add this game to the class first' });
 
     res.json({
       ok: true,
@@ -677,6 +1382,244 @@ app.put('/api/game-access/:gameKey', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Shared identity helpers
+// ---------------------------------------------------------------------------
+
+// Walks Student.mergedInto links to the ultimate primary so callers never see a
+// merge chain. Falls back to the record itself if a link is broken/missing.
+async function resolvePrimaryStudent(student, depth = 0) {
+  if (!student || !student.mergedInto || depth > 10) return student;
+  const parent = await Student.findById(student.mergedInto).lean();
+  if (!parent) return student;
+  return resolvePrimaryStudent(parent, depth + 1);
+}
+
+// The class-identity payload shared by every login mode.
+function classInfoPayload(classroom) {
+  return {
+    classId: classroom.classId,
+    className: classroom.className,
+    classAlias: classroom.classAlias || classroom.className,
+    classCode: classroom.classCode || null,
+    classType: classroom.classType || 'k1',
+    isPublic: Boolean(classroom.isPublic),
+    image: classroom.image || null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// System config (maintenance mode). Reads are public so the frontend gate can
+// poll them; writes are admin-only.
+// ---------------------------------------------------------------------------
+app.get('/api/system/config', async (_req, res) => {
+  try {
+    const doc = await SystemConfig.findById('system').lean();
+    res.json({
+      maintenanceMode: Boolean(doc?.maintenanceMode),
+      maintenanceMessage: doc?.maintenanceMessage || '',
+      maintenanceEndsAt: doc?.maintenanceEndsAt || null,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load system config' });
+  }
+});
+
+app.patch('/api/system/config', async (req, res) => {
+  try {
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
+
+    const update = { updatedAt: new Date(), updatedBy: admin.name };
+    if (typeof req.body.maintenanceMode === 'boolean') {
+      update.maintenanceMode = req.body.maintenanceMode;
+    }
+    if (typeof req.body.maintenanceMessage === 'string') {
+      update.maintenanceMessage = req.body.maintenanceMessage.slice(0, 300);
+    }
+    if ('maintenanceEndsAt' in req.body) {
+      update.maintenanceEndsAt = req.body.maintenanceEndsAt
+        ? new Date(req.body.maintenanceEndsAt)
+        : null;
+    }
+
+    const doc = await SystemConfig.findByIdAndUpdate(
+      'system',
+      { $set: update, $setOnInsert: { _id: 'system' } },
+      { upsert: true, new: true }
+    ).lean();
+
+    res.json({
+      maintenanceMode: Boolean(doc.maintenanceMode),
+      maintenanceMessage: doc.maintenanceMessage || '',
+      maintenanceEndsAt: doc.maintenanceEndsAt || null,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not update system config' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Code namespace check + polymorphic lookup (v2)
+// ---------------------------------------------------------------------------
+
+// Encapsulates findCodeOwner() for the UI's live "code available" indicators.
+// The create/update endpoints still hard-reject duplicates regardless.
+app.post('/api/codes/check', async (req, res) => {
+  try {
+    const code = (req.body.code || '').toString().trim();
+    if (!code) return res.status(400).json({ error: 'code is required' });
+    const reason = await findCodeOwner(code, {
+      teacherId: req.body.excludeTeacherId,
+      classId: req.body.excludeClassId,
+      studentId: req.body.excludeStudentId,
+    });
+    res.json(reason ? { available: false, reason } : { available: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not check code' });
+  }
+});
+
+// Classifies a code into exactly one identity kind so the login flow can branch.
+app.post('/api/code-lookup', async (req, res) => {
+  try {
+    const code = (req.body.code || '').toString().trim();
+    if (!code) return res.status(400).json({ error: 'code is required' });
+
+    // 1. The single global admin code.
+    if (code === ADMIN_CODE) {
+      return res.json({ kind: 'adminCode', name: ADMIN_NAME, role: 'admin' });
+    }
+
+    // 2. Teacher code.
+    const teacher = await Teacher.findOne({ code }).lean();
+    if (teacher) {
+      const classInfo = teacher.classId
+        ? await ClassInfo.findOne({ classId: teacher.classId }).lean()
+        : null;
+      return res.json({
+        kind: 'teacherCode',
+        name: teacher.name,
+        classId: teacher.classId,
+        className: classInfo?.className || teacher.classId || null,
+        classAlias: classInfo?.classAlias || classInfo?.className || null,
+        classCode: classInfo?.classCode || null,
+        role: teacher.role || 'teacher',
+      });
+    }
+
+    // 3. Class code. isPublic decides whether step 2 asks for a name (public)
+    //    or a student code (private).
+    const classroom = await ClassInfo.findOne({ classCode: code }).lean();
+    if (classroom) {
+      return res.json({
+        kind: 'classCode',
+        classId: classroom.classId,
+        className: classroom.className,
+        classAlias: classroom.classAlias || classroom.className,
+        classCode: classroom.classCode,
+        isPublic: Boolean(classroom.isPublic),
+      });
+    }
+
+    // 4. Student code. Resolve any merge chain to the primary identity.
+    const student = await Student.findOne({ code: code.toUpperCase() }).lean();
+    if (student) {
+      const primary = await resolvePrimaryStudent(student);
+      const classInfo = await ClassInfo.findOne({ classId: primary.classId }).lean();
+      return res.json({
+        kind: 'studentCode',
+        studentId: primary.studentId,
+        studentName: primary.nickname || primary.fullName,
+        classId: primary.classId,
+        className: classInfo?.className || primary.classId,
+        classAlias: classInfo?.classAlias || classInfo?.className || null,
+        classCode: classInfo?.classCode || null,
+        mergedInto: student.mergedInto ? String(student.mergedInto) : null,
+      });
+    }
+
+    return res.status(404).json({ kind: 'invalid', error: 'Code not recognized' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not look up code' });
+  }
+});
+
+// POST /api/student-login v2 — supports both login modes:
+//   mode A: { studentCode }        → rostered/private login
+//   mode B: { name, classCode }    → public "light" login
+app.post('/api/student-login', async (req, res) => {
+  try {
+    const { studentCode, name: rawName, classCode } = req.body;
+
+    if (studentCode) {
+      const student = await Student.findOne({
+        code: studentCode.toString().trim().toUpperCase(),
+      }).lean();
+      if (!student) {
+        return res.status(404).json({ error: 'Student code not found' });
+      }
+      const primary = await resolvePrimaryStudent(student);
+      const classInfo = await ClassInfo.findOne({ classId: primary.classId }).lean();
+      if (!classInfo) {
+        return res.status(500).json({ error: 'Class not found for this student' });
+      }
+      return res.json({
+        identityKind: 'student-rostered',
+        student: {
+          studentId: primary.studentId,
+          name: primary.nickname || primary.fullName,
+          code: student.code,
+        },
+        classInfo: classInfoPayload(classInfo),
+      });
+    }
+
+    // mode B — public-class light login.
+    const name = (rawName || '').toString().trim().slice(0, 40);
+    if (!name) {
+      return res.status(400).json({ error: 'A name is required' });
+    }
+    const classroom = await ClassInfo.findOne({
+      classCode: (classCode || '').toString().trim(),
+    }).lean();
+    if (!classroom) {
+      return res.status(404).json({ error: 'Class code not found' });
+    }
+    if (!classroom.isPublic) {
+      return res.status(403).json({
+        error: 'This class requires an individual student code',
+      });
+    }
+
+    // If a roster student already has this exact name, bind the light session
+    // to that record so its history groups under one identity (no backfill).
+    const existing = await Student.findOne({
+      classId: classroom.classId,
+      $or: [{ nickname: name }, { fullName: name }],
+    }).lean();
+
+    return res.json({
+      identityKind: existing ? 'student-rostered' : 'student-light',
+      student: existing
+        ? {
+            studentId: existing.studentId,
+            name: existing.nickname || existing.fullName,
+            code: existing.code,
+          }
+        : { studentId: null, name, code: null },
+      classInfo: classInfoPayload(classroom),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not log in' });
+  }
+});
+
 // Log one completed play session.
 app.post('/api/plays', async (req, res) => {
   try {
@@ -684,6 +1627,7 @@ app.post('/api/plays', async (req, res) => {
       game,
       playerName,
       classId: requestedClassId,
+      studentId: requestedStudentId,
       stars,
       totalRounds,
       peakStreak,
@@ -699,6 +1643,27 @@ app.post('/api/plays', async (req, res) => {
     const classId = (await isKnownClass(requestedClassId)) ? requestedClassId : null;
     if (!classId) {
       return res.status(400).json({ error: 'A valid classId is required' });
+    }
+
+    // When the caller identifies the student, chase any merge to the primary so
+    // the session is stamped with a durable identity and the canonical name.
+    let sessionStudentId = null;
+    let sessionPlayerName = (playerName || 'Guest').toString().slice(0, 40);
+    const requestedStudentIdClean = (requestedStudentId || '').toString().trim();
+    if (requestedStudentIdClean) {
+      const student = await Student.findOne({
+        studentId: requestedStudentIdClean,
+        classId,
+      }).lean();
+      if (student) {
+        const primary = await resolvePrimaryStudent(student);
+        sessionStudentId = primary.studentId;
+        sessionPlayerName = (
+          primary.nickname ||
+          primary.fullName ||
+          sessionPlayerName
+        ).toString().slice(0, 40);
+      }
     }
 
     const safeTotalRounds = Number(totalRounds) || 0;
@@ -733,7 +1698,8 @@ app.post('/api/plays', async (req, res) => {
     const session = await PlaySession.create({
       classId,
       game,
-      playerName: (playerName || 'Guest').toString().slice(0, 40),
+      playerName: sessionPlayerName,
+      studentId: sessionStudentId,
       stars: safeStars,
       totalRounds: safeTotalRounds,
       peakStreak: Math.max(0, Number(peakStreak) || 0),
@@ -1259,108 +2225,233 @@ app.get('/api/weekly-mission', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// One-time boot migration: GameAccess classId → classType
+// Admin stats (merge-aware). Merges physically retag playerName to the primary,
+// so counting distinct playerName already collapses a merged group to one.
 // ---------------------------------------------------------------------------
-// Runs on every deploy but is idempotent — guards check for the presence of
-// the old `classId` field before acting, so re-deploys skip it harmlessly.
-// Once all existing data has been migrated, this is a no-op.
-
-async function migrateClassTypeAndGameAccess() {
-  // Step 0 — Ensure legacy PlaySession docs have a classId.
-  await PlaySession.updateMany(
-    { classId: { $exists: false } },
-    { $set: { classId: LEGACY_CLASS_ID } }
-  );
-
-  // Step 1 — Give every existing teacher a role if they don't have one.
-  const teacherRoleResult = await Teacher.updateMany(
-    { role: { $exists: false } },
-    { $set: { role: 'admin' } }
-  );
-  if (teacherRoleResult.modifiedCount > 0) {
-    console.log(`Set role='admin' for ${teacherRoleResult.modifiedCount} teachers`);
-  }
-
-  // Step 2 — Ensure every ClassInfo has a classType (already done by the
-  // existing migrateClassTypes, but keep the guard here for clarity).
-  const classTypeResult = await ClassInfo.updateMany(
-    { classType: { $exists: false } },
-    { $set: { classType: 'k1' } }
-  );
-  if (classTypeResult.modifiedCount > 0) {
-    console.log(`Set classType='k1' for ${classTypeResult.modifiedCount} classes`);
-  }
-
-  // Step 3 — Migrate GameAccess from classId to classType.
-  // Only proceed if any GameAccess doc still has the old `classId` field.
-  const oldDocCount = await GameAccess.countDocuments({ classId: { $exists: true } });
-  if (oldDocCount === 0) {
-    // Already migrated — skip to index cleanup only.
-    await cleanupGameAccessIndexes();
-    return;
-  }
-
-  console.log(`Migrating ${oldDocCount} GameAccess docs from classId → classType…`);
-
-  // For each gameKey, prefer the row from the legacy K1 class as the source
-  // of truth for classType 'k1'. Both existing classes are K1 anyway.
-  const oldDocs = await GameAccess.find({ classId: { $exists: true } }).lean();
-
-  // Group by gameKey, prefer k12026-pny when there are duplicates.
-  const byGameKey = new Map();
-  for (const doc of oldDocs) {
-    const existing = byGameKey.get(doc.gameKey);
-    if (!existing || doc.classId === LEGACY_CLASS_ID) {
-      byGameKey.set(doc.gameKey, doc);
-    }
-  }
-
-  // Upsert one classType='k1' row per gameKey carrying over settings.
-  const upsertOps = [];
-  for (const [gameKey, doc] of byGameKey) {
-    upsertOps.push({
-      updateOne: {
-        filter: { classType: 'k1', gameKey },
-        update: {
-          $set: {
-            added: doc.added ?? true,
-            unlocked: doc.unlocked ?? false,
-            shiny: doc.shiny ?? false,
-            order: doc.order ?? 0,
-            updatedBy: doc.updatedBy || null,
-            updatedAt: doc.updatedAt || new Date(),
+async function computeClassStats(classId) {
+  const agg = await PlaySession.aggregate([
+    { $match: { classId } },
+    {
+      $facet: {
+        plays: [{ $count: 'n' }],
+        players: [{ $group: { _id: '$playerName' } }, { $count: 'n' }],
+        basic: [
+          {
+            $group: {
+              _id: '$game',
+              plays: { $sum: 1 },
+              avgStars: { $avg: '$stars' },
+              bestStreak: { $max: '$peakStreak' },
+              avgElapsedSeconds: { $avg: '$elapsedSeconds' },
+            },
           },
-          $setOnInsert: { classType: 'k1' },
-        },
-        upsert: true,
+        ],
+        playersPerGame: [
+          { $group: { _id: { game: '$game', playerName: '$playerName' } } },
+          { $group: { _id: '$_id.game', players: { $sum: 1 } } },
+        ],
       },
-    });
+    },
+  ]);
+
+  const totalPlays = agg[0]?.plays?.[0]?.n ?? 0;
+  const uniquePlayers = agg[0]?.players?.[0]?.n ?? 0;
+
+  const byGame = new Map((agg[0]?.basic ?? []).map((g) => [g._id, g]));
+  for (const g of agg[0]?.playersPerGame ?? []) {
+    if (byGame.has(g._id)) byGame.get(g._id).players = g.players;
   }
-
-  if (upsertOps.length > 0) {
-    await GameAccess.bulkWrite(upsertOps);
-  }
-
-  // Remove old classId-keyed documents.
-  const deleteResult = await GameAccess.deleteMany({ classId: { $exists: true } });
-  console.log(`Deleted ${deleteResult.deletedCount} old classId-keyed GameAccess docs`);
-
-  await cleanupGameAccessIndexes();
-  console.log('GameAccess classId → classType migration complete');
+  const perGame = [...byGame.values()].sort((a, b) =>
+    String(a._id).localeCompare(String(b._id))
+  );
+  return { totalPlays, uniquePlayers, perGame };
 }
 
-// Drops the old {classId, gameKey} unique index if it still exists, then
-// syncs indexes so the new {classType, gameKey} index from the model takes
-// effect. Also drops any legacy gameKey-only index.
+// One summary row per class for the admin stats grid.
+app.get('/api/admin/stats/classes', async (req, res) => {
+  try {
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
+
+    const classes = await ClassInfo.find().lean();
+    const rows = await Promise.all(
+      classes.map(async (classroom) => {
+        const stats = await computeClassStats(classroom.classId);
+        return {
+          classId: classroom.classId,
+          className: classroom.className,
+          classAlias: classroom.classAlias || classroom.className,
+          classCode: classroom.classCode || null,
+          isPublic: Boolean(classroom.isPublic),
+          active: classroom.active !== false,
+          totalPlays: stats.totalPlays,
+          totalPlayers: stats.uniquePlayers,
+        };
+      })
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load admin class stats' });
+  }
+});
+
+// Drill-down: same shape as the teacher /api/stats but for any classId.
+app.get('/api/admin/stats/classes/:classId', async (req, res) => {
+  try {
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
+    const { classId } = req.params;
+    if (!(await isKnownClass(classId))) {
+      return res.status(404).json({ error: 'Class not found' });
+    }
+    res.json(await computeClassStats(classId));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load class stats' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Boot migrations (idempotent, non-destructive, legacy-preserving)
+// ---------------------------------------------------------------------------
+// Each runs on every deploy but no-ops once its work is done, so redeploys are
+// safe. They never delete existing classes, students, codes, or play history.
+// The old classType-keyed GameAccess rows are deliberately retained as a
+// rollback backup rather than deleted in this pass.
+
+// Ensures the SystemConfig singleton exists with maintenanceMode off.
+async function ensureSystemConfig() {
+  const existing = await SystemConfig.findById('system').lean();
+  if (existing) return;
+  await SystemConfig.create({ _id: 'system', maintenanceMode: false });
+  console.log('Created SystemConfig singleton (maintenanceMode=false)');
+}
+
+// Creates the single admin code and downgrades every other role=admin record to
+// teacher, so only ezadmin12/10/22 is admin after this runs.
+async function migrateAdminRole() {
+  const adminExists = await Teacher.findOne({ code: ADMIN_CODE }).lean();
+  if (!adminExists) {
+    await Teacher.create({
+      code: ADMIN_CODE,
+      name: ADMIN_NAME,
+      classId: null,
+      role: 'admin',
+      active: true,
+    });
+    console.log(`Created admin code ${ADMIN_CODE}`);
+  }
+
+  const downgrade = await Teacher.updateMany(
+    { code: { $ne: ADMIN_CODE }, role: 'admin' },
+    { $set: { role: 'teacher' } }
+  );
+  if (downgrade.modifiedCount > 0) {
+    console.log(`Downgraded ${downgrade.modifiedCount} admin(s) to teacher`);
+  }
+
+  // Safe defaults for records predating these fields.
+  await Teacher.updateMany({ role: { $exists: false } }, { $set: { role: 'teacher' } });
+  await Teacher.updateMany({ active: { $exists: false } }, { $set: { active: true } });
+}
+
+// Backfills the new ClassInfo fields with safe defaults. Never rewrites the
+// classId, className, or image; classType is left untouched (now storage-only).
+const autoCodedClasses = [];
+
+async function migrateClassFields() {
+  const classes = await ClassInfo.find({
+    $or: [
+      { isPublic: { $exists: false } },
+      { active: { $exists: false } },
+      { classCode: { $exists: false } },
+      { classAlias: { $exists: false } },
+      { classAlias: null },
+    ],
+  });
+
+  for (const classroom of classes) {
+    let changed = false;
+
+    if (classroom.isPublic === undefined) {
+      classroom.isPublic = false; // legacy classes stay private (current behavior)
+      changed = true;
+    }
+    if (classroom.active === undefined) {
+      classroom.active = true;
+      changed = true;
+    }
+    if (!classroom.classAlias) {
+      classroom.classAlias = classroom.className; // safe, preserves meaning
+      changed = true;
+    }
+    if (!classroom.classCode) {
+      classroom.classCode = await generateClassCode();
+      autoCodedClasses.push({
+        classId: classroom.classId,
+        classCode: classroom.classCode,
+      });
+      changed = true;
+    }
+
+    if (changed) await classroom.save();
+  }
+
+  if (autoCodedClasses.length > 0) {
+    console.log(
+      'Auto-generated class codes (admin should review):',
+      autoCodedClasses.map((c) => `${c.classId}=${c.classCode}`).join(', ')
+    );
+  }
+}
+
+// Clones classType-keyed GameAccess rows into per-class classId rows. The old
+// classType rows are intentionally NOT deleted (kept as a rollback backup).
+async function migrateGameAccessToClassId() {
+  const classes = await ClassInfo.find().lean();
+
+  for (const classroom of classes) {
+    // Idempotent guard: skip classes that already have their own rows.
+    const already = await GameAccess.countDocuments({ classId: classroom.classId });
+    if (already > 0) continue;
+
+    const classType = classroom.classType || 'k1';
+    const sourceRows = await GameAccess.find({
+      classType,
+      classId: { $exists: false },
+    }).lean();
+    if (sourceRows.length === 0) continue;
+
+    await GameAccess.insertMany(
+      sourceRows.map((row) => ({
+        classId: classroom.classId,
+        gameKey: row.gameKey,
+        added: row.added ?? false,
+        unlocked: row.unlocked ?? false,
+        order: row.order ?? 0,
+        shiny: row.shiny ?? false,
+        updatedBy: row.updatedBy || null,
+        updatedAt: row.updatedAt || new Date(),
+      })),
+      { ordered: false }
+    );
+    console.log(`Cloned ${sourceRows.length} GameAccess rows → class ${classroom.classId}`);
+  }
+
+  await cleanupGameAccessIndexes();
+}
+
+// Drops the legacy classType-keyed unique index so the new partial
+// {classId, gameKey} index from the model can take effect.
 async function cleanupGameAccessIndexes() {
   const existingIndexes = await GameAccess.collection.indexes();
-  const indexNames = existingIndexes.map((idx) => idx.name);
-
-  for (const name of indexNames) {
-    if (name === 'classId_1_gameKey_1' || name === 'gameKey_1') {
+  for (const idx of existingIndexes) {
+    if (idx.name === 'classType_1_gameKey_1') {
       try {
-        await GameAccess.collection.dropIndex(name);
-        console.log(`Dropped legacy index: ${name}`);
+        await GameAccess.collection.dropIndex(idx.name);
+        console.log(`Dropped legacy index: ${idx.name}`);
       } catch (err) {
         if (err.codeName !== 'IndexNotFound' && err.code !== 27) throw err;
       }
@@ -1368,6 +2459,41 @@ async function cleanupGameAccessIndexes() {
   }
 
   await GameAccess.syncIndexes();
+}
+
+// One-time audit: reports duplicate or cross-conflicting codes WITHOUT renaming
+// anything, since changing a code would break printed badges/shared links.
+async function auditCodeConflicts() {
+  const [teachers, classes, students] = await Promise.all([
+    Teacher.find({ active: { $ne: false } }).select('code -_id').lean(),
+    ClassInfo.find().select('classCode -_id').lean(),
+    Student.find({ code: { $exists: true } }).select('code -_id').lean(),
+  ]);
+
+  const seen = new Map();
+  const conflicts = [];
+  const add = (code, bucket) => {
+    if (!code) return;
+    const key = code.toString().trim();
+    if (!key) return;
+    if (seen.has(key)) {
+      conflicts.push({ code: key, buckets: [seen.get(key), bucket] });
+    } else {
+      seen.set(key, bucket);
+    }
+  };
+  teachers.forEach((t) => add(t.code, 'teacher'));
+  classes.forEach((c) => add(c.classCode, 'class'));
+  students.forEach((s) => add(s.code, 'student'));
+
+  if (conflicts.length > 0) {
+    console.warn(
+      `Code namespace conflicts found (${conflicts.length}) — admin should resolve:`,
+      JSON.stringify(conflicts)
+    );
+  } else {
+    console.log('Code namespace audit: no conflicts');
+  }
 }
 
 // Assigns random 6-character codes to existing students that don't have one
@@ -1426,10 +2552,17 @@ mongoose
   })
   .then(async () => {
     await seedDirectoryIfEmpty();
-    await migrateClassTypeAndGameAccess();
+    await ensureSystemConfig();
+    await migrateAdminRole();
+    await migrateClassFields();
+    await migrateGameAccessToClassId();
     await migrateStudentCodes();
+    await auditCodeConflicts();
+    await ClassInfo.syncIndexes();
+    await Teacher.syncIndexes();
     await Student.syncIndexes();
     await PlaySession.syncIndexes();
+    await PlayerMerge.syncIndexes();
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
     });

@@ -32,6 +32,19 @@ const studentSchema = new mongoose.Schema({
     uppercase: true,
     maxlength: 6,
   },
+  // Merge bookkeeping. When a teacher recognises that two roster entries are
+  // the same child, the non-primary record is marked mergedInto the primary
+  // (never deleted) so the merge stays reversible. Null on primaries and on
+  // students that were never merged.
+  mergedInto: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Student',
+    default: null,
+    index: true,
+  },
+  mergedAt: { type: Date, default: null },
+  // Teacher code that performed the merge — audit only, no behaviour keyed off it.
+  mergedBy: { type: String, default: null },
   createdAt: { type: Date, default: Date.now },
 });
 

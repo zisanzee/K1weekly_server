@@ -5,6 +5,14 @@ const playSessionSchema = new mongoose.Schema({
   classId: { type: String, required: true, default: 'k12026-pny', index: true },
   game: { type: String, required: true }, // e.g. "game1", "game2", "game3"
   playerName: { type: String, default: 'Guest' },
+  // The roster Student.studentId this play belongs to, when known (rostered
+  // login, or a name-merge that resolved to a rostered primary). Null for
+  // "light" public-class players who only ever gave a name.
+  studentId: { type: String, default: null, index: true },
+  // Set only on sessions that a student merge physically retagged: the
+  // playerName this row had *before* the merge. Lets unmerge restore rows to
+  // their exact pre-merge identity — null on never-merged rows.
+  mergedFrom: { type: String, default: null },
   stars: { type: Number, required: true },
   totalRounds: { type: Number, required: true },
   peakStreak: { type: Number, default: 0 },

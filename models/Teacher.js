@@ -7,10 +7,14 @@ const mongoose = require('mongoose');
 const teacherSchema = new mongoose.Schema({
   code: { type: String, required: true, unique: true, trim: true },
   name: { type: String, required: true, trim: true },
-  classId: { type: String, required: true, index: true },
-  // 'admin' can edit game config for any classType; 'teacher' can only view
-  // their own class's data and manage their own roster.
+  // Null for the global admin, who is not bound to any single class.
+  classId: { type: String, default: null, index: true },
+  // 'admin' can edit any class's config; 'teacher' can only view and manage
+  // their own class. Only one admin code exists after the migration.
   role: { type: String, enum: ['teacher', 'admin'], default: 'teacher' },
+  // Soft-deactivate rather than delete a teacher, so historical stats rows
+  // that reference them keep resolving to a real record.
+  active: { type: Boolean, default: true, required: true },
 });
 
 module.exports = mongoose.model('Teacher', teacherSchema);

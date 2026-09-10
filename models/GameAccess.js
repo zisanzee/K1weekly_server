@@ -1,18 +1,13 @@
 const mongoose = require('mongoose');
 
 const gameAccessSchema = new mongoose.Schema({
-  // Game config is now scoped per class type (k1/k2), not per individual
-  // class. Every class of the same type shares the identical arrangement.
-  classType: {
-    type: String,
-    required: true,
-    enum: ['k1', 'k2'],
-    index: true,
-    default: 'k1',
-  },
+  // Game config is now scoped per individual class. Two classes of the same
+  // legacy classType no longer share an arrangement — each class owns its own
+  // rows and admins/teachers edit them by classId.
+  classId: { type: String, required: true, index: true },
   gameKey: { type: String, required: true },
 
-  // A class type shows only games an admin has added from the game shop.
+  // A class shows only games added from the game shop.
   added: { type: Boolean, default: false },
   unlocked: { type: Boolean, default: false },
 
@@ -24,10 +19,24 @@ const gameAccessSchema = new mongoose.Schema({
 
   updatedBy: { type: String, default: null },
   updatedAt: { type: Date, default: Date.now },
+
+  // DEPRECATED backup: pre-migration rows keyed by classType are intentionally
+  // retained (not deleted) so a bad migration can be rolled back. They carry no
+  // classId and are therefore excluded from the unique index below, which is
+  // why the index is partial rather than a plain compound unique index.
+  classType: { type: String, default: null },
 });
 
-// One row per {classType, gameKey} — every class of the same type reads
-// from the same set of rows.
-gameAccessSchema.index({ classType: 1, gameKey: 1 }, { unique: true });
+// One row per {classId, gameKey} for live (classId-keyed) rows. The partial
+// filter keeps the legacy classType-only backup rows out of the index so they
+// can't collide with the new per-class rows during the transition.
+gameAccessSchema.index(
+  { classId: 1, gameKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { classId: { $exists: true } },
+    name: 'classId_1_gameKey_1',
+  }
+);
 
 module.exports = mongoose.model('GameAccess', gameAccessSchema);

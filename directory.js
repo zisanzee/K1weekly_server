@@ -22,7 +22,10 @@ async function lookupTeacher(code) {
     name: teacher.name,
     classId: teacher.classId,
     className: classInfo?.className || teacher.classId,
+    classAlias: classInfo?.classAlias || classInfo?.className || null,
+    classCode: classInfo?.classCode || null,
     classType: classInfo?.classType || 'k1',
+    isPublic: Boolean(classInfo?.isPublic),
     role: teacher.role || 'teacher',
   };
 }
