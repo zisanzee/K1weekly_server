@@ -53,24 +53,10 @@ async function isKnownClass(classId) {
   return Boolean(await ClassInfo.exists({ classId }));
 }
 
-// One-time seed so existing deployments keep working after switching from
-// the hardcoded file to the database. Only inserts when a collection is
-// completely empty, so it's safe to leave this call in place permanently —
-// it will never overwrite codes/classes added later through the database.
-async function seedDirectoryIfEmpty() {
-  if ((await Teacher.countDocuments()) === 0) {
-    await Teacher.insertMany([
-      { code: '12/10/22', name: 'Siti Soleha', classId: 'k12026-pny', role: 'admin' },
-      { code: '92702689', name: 'DEVZee', classId: 'test2026-jyx', role: 'admin' },
-    ]);
-  }
+// NOTE: the old seedDirectoryIfEmpty() was removed on purpose. It hardcoded
+// teacher codes and classes in source, which we no longer want. The only
+// bootstrapped credential now comes from the ADMIN_CODE env var (see
+// migrateAdminRole in server.js); everything else is created through the admin
+// panel and lives solely in the database.
 
-  if ((await ClassInfo.countDocuments()) === 0) {
-    await ClassInfo.insertMany([
-      { classId: 'k12026-pny', className: 'Kindergarten 1', classType: 'k1' },
-      { classId: 'test2026-jyx', className: 'Test class', classType: 'k1' },
-    ]);
-  }
-}
-
-module.exports = { lookupTeacher, getClasses, isKnownClass, seedDirectoryIfEmpty, classTypeForClassId };
+module.exports = { lookupTeacher, getClasses, isKnownClass, classTypeForClassId };

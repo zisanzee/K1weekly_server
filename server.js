@@ -14,12 +14,7 @@ const ClassInfo = require('./models/ClassInfo');
 const Student = require('./models/Student');
 const SystemConfig = require('./models/SystemConfig');
 const PlayerMerge = require('./models/PlayerMerge');
-const {
-  lookupTeacher,
-  getClasses,
-  isKnownClass,
-  seedDirectoryIfEmpty,
-} = require('./directory');
+const { lookupTeacher, getClasses, isKnownClass } = require('./directory');
 
 const app = express();
 
@@ -134,15 +129,48 @@ app.get('/api/classes', async (req, res) => {
       const admin = await requireAdmin(req, res);
       if (!admin) return;
       const classes = await ClassInfo.find().lean();
+
+      // Count DISTINCT identities per class, not just roster records. A class's
+      // real students include public-class "light" players who only ever gave a
+      // name (no Student record), so we union non-merged roster names with the
+      // distinct playerNames seen in play sessions. Batched into one roster read
+      // plus one aggregation so the count is stable no matter how many classes.
+      const [roster, playRows] = await Promise.all([
+        Student.find({ mergedInto: null })
+          .select('classId nickname fullName -_id')
+          .lean(),
+        PlaySession.aggregate([
+          { $match: { playerName: { $nin: [null, '', 'Guest'] } } },
+          { $group: { _id: '$classId', names: { $addToSet: '$playerName' } } },
+        ]),
+      ]);
+
+      const identityNames = new Map(); // classId -> Set(display name)
+      const addName = (classId, name) => {
+        if (!classId) return;
+        const trimmed = (name || '').toString().trim();
+        if (!trimmed || trimmed === 'Guest') return;
+        let set = identityNames.get(classId);
+        if (!set) {
+          set = new Set();
+          identityNames.set(classId, set);
+        }
+        set.add(trimmed);
+      };
+      for (const s of roster) {
+        addName(s.classId, s.nickname);
+        addName(s.classId, s.fullName);
+      }
+      for (const row of playRows) {
+        for (const name of row.names || []) addName(row._id, name);
+      }
+
       const rows = await Promise.all(
         classes.map(async (classroom) => {
-          const [teacherCount, studentCount] = await Promise.all([
-            Teacher.countDocuments({
-              classId: classroom.classId,
-              active: { $ne: false },
-            }),
-            Student.countDocuments({ classId: classroom.classId }),
-          ]);
+          const teacherCount = await Teacher.countDocuments({
+            classId: classroom.classId,
+            active: { $ne: false },
+          });
           return {
             id: classroom.classId,
             classId: classroom.classId,
@@ -155,7 +183,7 @@ app.get('/api/classes', async (req, res) => {
             isPublic: Boolean(classroom.isPublic),
             active: classroom.active !== false,
             teacherCount,
-            studentCount,
+            studentCount: identityNames.get(classroom.classId)?.size || 0,
           };
         })
       );
@@ -546,14 +574,17 @@ app.delete('/api/students/:studentId', async (req, res) => {
 
     const { studentId } = req.params;
 
-    const result = await Student.deleteOne({
+    const student = await Student.findOne({
       studentId,
       classId: teacher.classId,
-    });
+    }).lean();
 
-    if (result.deletedCount === 0) {
+    if (!student) {
       return res.status(404).json({ error: 'Student not found in your class' });
     }
+
+    await Student.deleteOne({ _id: student._id });
+    await removeStudentPlaySessions(teacher.classId, student);
 
     res.json({ ok: true });
   } catch (err) {
@@ -737,10 +768,14 @@ app.delete('/api/classes/:classId/students/:studentId', async (req, res) => {
     const actor = await requireClassAccess(req, res, classId);
     if (!actor) return;
 
-    const result = await Student.deleteOne({ studentId, classId });
-    if (result.deletedCount === 0) {
+    const student = await Student.findOne({ studentId, classId }).lean();
+    if (!student) {
       return res.status(404).json({ error: 'Student not found in this class' });
     }
+
+    await Student.deleteOne({ _id: student._id });
+    await removeStudentPlaySessions(classId, student);
+
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -1055,8 +1090,12 @@ async function requireClassAccess(req, res, classId) {
 // a bucket are rejected by each collection's own unique index. MongoDB cannot
 // enforce uniqueness across collections, so every create/update that changes a
 // code must call findCodeOwner() and reject when it returns a reason.
-const ADMIN_CODE = 'ezadmin12/10/22';
-const ADMIN_NAME = 'Admin';
+// The single admin credential is supplied by the environment so no secret is
+// committed to the repo. Set ADMIN_CODE (and optionally ADMIN_NAME) in the
+// deploy/host env. When unset, the admin bootstrap is skipped and the app is
+// still fully runnable — an existing admin row in the DB keeps working.
+const ADMIN_CODE = (process.env.ADMIN_CODE || '').toString().trim();
+const ADMIN_NAME = (process.env.ADMIN_NAME || 'Admin').toString().trim();
 
 // Returns a conflict reason string when `code` is already taken, or null when
 // it's free. `exclude` lets an edit re-save its own code without tripping a
@@ -1088,7 +1127,7 @@ async function findCodeOwner(code, exclude = {}) {
 
   // The admin code is itself a Teacher document, so it's checked first to give
   // callers a distinct 'conflicts-with-admin' reason rather than 'duplicate-teacher'.
-  if (normalized === ADMIN_CODE) {
+  if (ADMIN_CODE && normalized === ADMIN_CODE) {
     const isSelf =
       exclude.teacherId &&
       teacher &&
@@ -1395,6 +1434,17 @@ async function resolvePrimaryStudent(student, depth = 0) {
   return resolvePrimaryStudent(parent, depth + 1);
 }
 
+// A deleted student's own play history is removed too, so the identity doesn't
+// linger as a name-only "light" entry in the roster — names are the identity
+// key, and leaving the sessions behind is why the row used to reappear.
+async function removeStudentPlaySessions(classId, student) {
+  const names = [student?.nickname, student?.fullName]
+    .map((n) => (n || '').toString().trim())
+    .filter(Boolean);
+  if (names.length === 0) return;
+  await PlaySession.deleteMany({ classId, playerName: { $in: names } });
+}
+
 // The class-identity payload shared by every login mode.
 function classInfoPayload(classroom) {
   return {
@@ -1489,8 +1539,8 @@ app.post('/api/code-lookup', async (req, res) => {
     const code = (req.body.code || '').toString().trim();
     if (!code) return res.status(400).json({ error: 'code is required' });
 
-    // 1. The single global admin code.
-    if (code === ADMIN_CODE) {
+    // 1. The single global admin code (only when configured via env).
+    if (ADMIN_CODE && code === ADMIN_CODE) {
       return res.json({ kind: 'adminCode', name: ADMIN_NAME, role: 'admin' });
     }
 
@@ -2329,9 +2379,19 @@ async function ensureSystemConfig() {
   console.log('Created SystemConfig singleton (maintenanceMode=false)');
 }
 
-// Creates the single admin code and downgrades every other role=admin record to
-// teacher, so only ezadmin12/10/22 is admin after this runs.
+// Creates the env-configured admin (if any) and downgrades every other
+// role=admin record to teacher, so only the ADMIN_CODE account is admin.
 async function migrateAdminRole() {
+  if (!ADMIN_CODE) {
+    console.warn(
+      'ADMIN_CODE is not set — skipping admin bootstrap. Set ADMIN_CODE in the environment to create/keep an admin.'
+    );
+    // Still give field-less records safe defaults so nothing breaks.
+    await Teacher.updateMany({ role: { $exists: false } }, { $set: { role: 'teacher' } });
+    await Teacher.updateMany({ active: { $exists: false } }, { $set: { active: true } });
+    return;
+  }
+
   const adminExists = await Teacher.findOne({ code: ADMIN_CODE }).lean();
   if (!adminExists) {
     await Teacher.create({
@@ -2341,9 +2401,11 @@ async function migrateAdminRole() {
       role: 'admin',
       active: true,
     });
-    console.log(`Created admin code ${ADMIN_CODE}`);
+    // Deliberately not logging the code itself.
+    console.log('Created the admin account from ADMIN_CODE.');
   }
 
+  // Downgrade every other admin so only the env-provided code is admin.
   const downgrade = await Teacher.updateMany(
     { code: { $ne: ADMIN_CODE }, role: 'admin' },
     { $set: { role: 'teacher' } }
@@ -2352,7 +2414,6 @@ async function migrateAdminRole() {
     console.log(`Downgraded ${downgrade.modifiedCount} admin(s) to teacher`);
   }
 
-  // Safe defaults for records predating these fields.
   await Teacher.updateMany({ role: { $exists: false } }, { $set: { role: 'teacher' } });
   await Teacher.updateMany({ active: { $exists: false } }, { $set: { active: true } });
 }
@@ -2557,7 +2618,6 @@ mongoose
     serverSelectionTimeoutMS: 5_000,
   })
   .then(async () => {
-    await seedDirectoryIfEmpty();
     await ensureSystemConfig();
     await migrateAdminRole();
     await migrateClassFields();
