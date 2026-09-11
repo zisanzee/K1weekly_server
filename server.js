@@ -1605,6 +1605,16 @@ const FEEDBACK_TO = (
 const FEEDBACK_FROM =
   process.env.FEEDBACK_FROM_EMAIL || 'EZ Wonders <onboarding@resend.dev>';
 
+// Announced once at boot, not only when someone submits. A missing key is a
+// deployment mistake, and the deploy log is where it should be noticed — not in
+// a user-facing 500 days later.
+if (!process.env.RESEND_API_KEY) {
+  console.warn(
+    'Feedback: RESEND_API_KEY is not set. POST /api/feedback will answer 500 ' +
+      'until it is configured in this environment.'
+  );
+}
+
 app.post('/api/feedback', async (req, res) => {
   try {
     const body = req.body || {};
