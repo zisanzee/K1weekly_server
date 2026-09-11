@@ -88,6 +88,20 @@ app.use((_req, res, next) => {
 // when adding new games to the frontend.
 const GAME_SLUG_RE = /^[a-zA-Z][a-zA-Z0-9]*$/;
 
+// Deliberately does NOT touch MongoDB. This exists so the keep-warm cron has
+// something cheap and reliable to hit: /api/health runs a real database ping,
+// which on a cold Render instance means the wake-up has to initialise the
+// connection pool AND wait for an Atlas round trip before responding — so the
+// warm-up request was itself slow, and could time out before the container was
+// actually warm. `ping` returns as soon as Express is listening, which is
+// exactly the signal "the instance is awake" is supposed to mean.
+//
+// It is not a health check — it says nothing about the database. Use
+// /api/health for that.
+app.get('/api/ping', (_req, res) => {
+  res.json({ ok: true });
+});
+
 app.get('/api/health', async (req, res) => {
   try {
     // A real round-trip to MongoDB — this keeps the connection pool warm
