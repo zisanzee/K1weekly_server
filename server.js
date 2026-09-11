@@ -1742,13 +1742,20 @@ app.post('/api/feedback', async (req, res) => {
       })
     );
 
+    const delivered = results.filter(Boolean).length;
+
     // Only a total failure is an error for the sender. Anything less means at
     // least one inbox has it, and the console has the details of the rest.
-    if (!results.some(Boolean)) {
+    if (delivered === 0) {
       return res.status(502).json({ error: 'Could not send feedback email' });
     }
 
-    res.json({ ok: true });
+    // The counts go back to the client on purpose. A 200 here only means "at
+    // least one inbox accepted it", so without this a rejected recipient fails
+    // completely silently — and a sender address that isn't verified (Resend
+    // refuses every recipient except the account owner's until then) is exactly
+    // the mistake this needs to be visible for.
+    res.json({ ok: true, delivered, recipients: FEEDBACK_TO.length });
   } catch (err) {
     console.error('Feedback route failed:', err);
     res.status(500).json({ error: 'Could not send feedback' });
