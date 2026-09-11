@@ -6,6 +6,7 @@ dns.setServers(['8.8.8.8', '1.1.1.1']);
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const { Resend } = require('resend');
 
 const PlaySession = require('./models/PlaySession');
 const GameAccess = require('./models/GameAccess');
@@ -1508,6 +1509,239 @@ app.patch('/api/system/config', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not update system config' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Feedback — emailed to the team via Resend.
+//
+// Deliberately unauthenticated, like /api/plays: feedback has to keep working
+// when a session is half-broken, which is exactly when someone is most likely
+// to write in. Abuse is handled with a honeypot plus a per-IP rate limit
+// instead of an auth check.
+// ---------------------------------------------------------------------------
+
+const FEEDBACK_WINDOW_MS = 10 * 60 * 1000;
+const FEEDBACK_MAX_PER_WINDOW = 5;
+const FEEDBACK_MESSAGE_MAX = 1200;
+
+// ip -> { count, resetAt }. In-memory on purpose: losing the buckets on a
+// restart is a non-event for feedback, and this avoids a store round-trip or an
+// extra dependency for a single low-traffic endpoint.
+const feedbackHits = new Map();
+
+// Sweep expired buckets so a long-lived process can't leak one entry per
+// visitor IP. Unref'd so this timer never keeps the process alive on its own.
+const feedbackSweep = setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of feedbackHits) {
+    if (entry.resetAt <= now) feedbackHits.delete(ip);
+  }
+}, FEEDBACK_WINDOW_MS);
+if (typeof feedbackSweep.unref === 'function') feedbackSweep.unref();
+
+function feedbackRateLimited(ip) {
+  const now = Date.now();
+  const entry = feedbackHits.get(ip);
+
+  if (!entry || entry.resetAt <= now) {
+    feedbackHits.set(ip, { count: 1, resetAt: now + FEEDBACK_WINDOW_MS });
+    return false;
+  }
+
+  entry.count += 1;
+  return entry.count > FEEDBACK_MAX_PER_WINDOW;
+}
+
+// Behind Render's proxy the client address is the first hop in
+// x-forwarded-for; req.ip is the fallback for direct and local calls.
+function clientIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.length > 0) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.ip || 'unknown';
+}
+
+function escapeHtml(value) {
+  // The entities below are written as \u0026-escaped literals deliberately.
+  // Spelling them out as plain "&"-style text risks an editor or tooling
+  // decoding them back to bare "&", which silently turns this into a no-op —
+  // exactly the failure this function exists to prevent.
+  return String(value ?? '')
+    .replace(/&/g, '\u0026amp;')
+    .replace(/</g, '\u0026lt;')
+    .replace(/>/g, '\u0026gt;')
+    .replace(/"/g, '\u0026quot;')
+    .replace(/'/g, '\u0026#39;');
+}
+
+// Collapses newlines so nothing a user typed can inject extra mail headers
+// (a subject line is a header, and a stray \n there is header injection).
+function oneLine(value) {
+  return String(value ?? '').replace(/[\r\n]+/g, ' ').trim();
+}
+
+// Built lazily so a missing key surfaces as a clear 500 on the request that
+// needs it, rather than crashing the process at boot.
+let resendClient = null;
+function getResendClient() {
+  if (!resendClient) {
+    const key = process.env.RESEND_API_KEY;
+    if (!key) return null;
+    resendClient = new Resend(key);
+  }
+  return resendClient;
+}
+
+// Comma-separated so adding or removing a recipient is an environment change on
+// the host rather than a code change and a redeploy.
+const FEEDBACK_TO = (
+  process.env.FEEDBACK_TO_EMAIL || 'zisankhanchowdhury@gmail.com'
+)
+  .split(',')
+  .map((address) => address.trim())
+  .filter(Boolean);
+const FEEDBACK_FROM =
+  process.env.FEEDBACK_FROM_EMAIL || 'EZ Wonders <onboarding@resend.dev>';
+
+app.post('/api/feedback', async (req, res) => {
+  try {
+    const body = req.body || {};
+
+    // Honeypot. Answers 200 so a bot gets no signal that it was dropped — a
+    // 4xx would only teach it to retry differently.
+    if ((body.botField || '').toString().trim()) {
+      return res.json({ ok: true });
+    }
+
+    const message = (body.message || '').toString().trim();
+    if (!message) {
+      return res.status(400).json({ error: 'A message is required' });
+    }
+    if (message.length > FEEDBACK_MESSAGE_MAX) {
+      return res.status(400).json({ error: 'That message is too long' });
+    }
+
+    const ip = clientIp(req);
+    if (feedbackRateLimited(ip)) {
+      return res
+        .status(429)
+        .json({ error: 'Too many messages sent. Please try again a bit later.' });
+    }
+
+    const resend = getResendClient();
+    if (!resend) {
+      console.error('Feedback: RESEND_API_KEY is not set');
+      return res.status(500).json({ error: 'Feedback email is not configured' });
+    }
+
+    const trunc = (value, max) => (value || '').toString().slice(0, max);
+
+    const name = trunc(body.name, 80) || '(not signed in)';
+    const className = trunc(body.className, 80) || '(no class)';
+    const classId = trunc(body.classId, 80);
+    const classType = trunc(body.classType, 20);
+    const role = trunc(body.role, 20) || 'unknown';
+    const page = trunc(body.page, 300);
+    const device = trunc(body.device, 300);
+    const userAgent = trunc(body.userAgent, 400);
+    const clientReportedIp = trunc(body.ip, 60);
+    const submittedAt = new Date();
+
+    // Ordered for triage: the human-readable identity first, then the machine
+    // context. `—` (not empty) so a thin row still reads as "deliberately blank"
+    // rather than looking like a rendering bug.
+    const rows = [
+      ['Name', name],
+      ['Class', className],
+      ['Class ID', classId || '—'],
+      ['Class type', classType || '—'],
+      ['Role', role],
+      ['Submitted', submittedAt.toUTCString()],
+      ['IP', ip],
+      ['Client-reported IP', clientReportedIp || '—'],
+      ['Device', device || '—'],
+      ['Page', page || '—'],
+      ['User agent', userAgent || '—'],
+    ];
+
+    // Every value is escaped before it reaches the HTML. This body is built
+    // from free text a child typed, so an unescaped "<" would let a message
+    // rewrite the email — or inject a link — inside the team's inbox.
+    const html = `
+      <div style="font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; color: #1e293b; max-width: 640px;">
+        <h2 style="margin: 0 0 4px; color: #4338ca;">New EZ Wonders feedback</h2>
+        <p style="margin: 0 0 16px; color: #64748b; font-size: 13px;">
+          Sent from the feedback button on the games home page.
+        </p>
+        <div style="padding: 16px; border-radius: 12px; background: #f1f5f9; border-left: 4px solid #6d28d9;">
+          <p style="margin: 0; white-space: pre-wrap; font-size: 15px; line-height: 1.6;">${escapeHtml(message)}</p>
+        </div>
+        <table style="margin-top: 20px; border-collapse: collapse; width: 100%; font-size: 13px;">
+          ${rows
+            .map(
+              ([label, value]) => `<tr>
+            <td style="padding: 6px 12px 6px 0; color: #64748b; white-space: nowrap; vertical-align: top;">${escapeHtml(label)}</td>
+            <td style="padding: 6px 0; color: #0f172a; word-break: break-word;">${escapeHtml(value)}</td>
+          </tr>`
+            )
+            .join('')}
+        </table>
+      </div>
+    `;
+
+    const subject = oneLine(
+      `EZ Wonders feedback — ${name}${className ? ` (${className})` : ''}`
+    );
+
+    const textBody = `${message}\n\n---\n${rows
+      .map(([label, value]) => `${label}: ${value || ''}`)
+      .join('\n')}`;
+
+    // One email per recipient, rather than handing Resend the whole array at
+    // once. Resend's shared `onboarding@resend.dev` sender only permits
+    // delivery to the account owner's own address, so a single disallowed
+    // recipient would otherwise fail the entire submission and break the form
+    // for everybody — including the addresses that would have worked. This way
+    // a partial failure still reaches whoever is reachable, and the bad address
+    // shows up in the logs instead of taking the feature down.
+    const results = await Promise.all(
+      FEEDBACK_TO.map(async (address) => {
+        const { error } = await resend.emails.send({
+          from: FEEDBACK_FROM,
+          to: address,
+          subject,
+          html,
+          // Plain-text twin: readable where HTML is blocked, and it is what
+          // inbox previews fall back to when they only read text/plain.
+          text: textBody,
+        });
+
+        // The SDK reports failures in the payload rather than throwing, so this
+        // has to be checked explicitly — otherwise a rejected send looks like
+        // a success.
+        if (error) {
+          console.error(
+            `Feedback: Resend rejected the send to ${address}:`,
+            error
+          );
+          return false;
+        }
+        return true;
+      })
+    );
+
+    // Only a total failure is an error for the sender. Anything less means at
+    // least one inbox has it, and the console has the details of the rest.
+    if (!results.some(Boolean)) {
+      return res.status(502).json({ error: 'Could not send feedback email' });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Feedback route failed:', err);
+    res.status(500).json({ error: 'Could not send feedback' });
   }
 });
 
