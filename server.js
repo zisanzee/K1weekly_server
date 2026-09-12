@@ -6,6 +6,9 @@ dns.setServers(['8.8.8.8', '1.1.1.1']);
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const compression = require('compression');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { Resend } = require('resend');
 
 const PlaySession = require('./models/PlaySession');
@@ -55,7 +58,34 @@ app.use(
   })
 );
 
-app.use(express.json());
+// Gzip/deflate every response. The JSON payloads here are large and highly
+// repetitive (stats rows, plays pages, game-access lists), so this is a
+// several-fold reduction on the wire for a few lines of code — and the
+// audience is largely school wifi.
+app.use(compression());
+
+// Security headers. `crossOriginResourcePolicy` is relaxed to `cross-origin`
+// because the frontend is served from a different origin than this API, and
+// the strict same-origin default would let browsers block the responses.
+// `contentSecurityPolicy` is disabled deliberately: this server only ever
+// returns JSON, never HTML, so a CSP here protects nothing and risks
+// interfering with error pages / CORS preflights.
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    // Render terminates TLS in front of this process, so without this the
+    // Referrer-Policy is the only header it can infer reliably. Emitting
+    // HSTS is safe because the public origin is always HTTPS.
+    hsts: { maxAge: 15552000, includeSubDomains: true },
+  })
+);
+
+// Cap the request body. The default is already 100kb, but stating it makes the
+// limit explicit and prevents a future Express default change from silently
+// widening it. Every endpoint here takes small JSON objects; /api/plays is the
+// largest at a few hundred bytes.
+app.use(express.json({ limit: '100kb' }));
 
 // Prevent browsers from caching any API response. Without this, a stale
 // cached 5xx or empty response can lock users on the loading spinner even
@@ -120,8 +150,65 @@ app.get('/api/health', async (req, res) => {
 // Validates a teacher code against the DB and returns everything the
 // frontend needs to populate the zustand player store. This replaces the
 // old hardcoded TEACHER_CODES mirror — the server is the single source of
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+// Apply ONLY to endpoints that are unauthenticated (or cheap to hit) and where
+// guessing has real value. The authenticated write paths are deliberately left
+// unlimited: a whole class can legitimately burst through /api/plays as
+// children finish rounds at the same moment, and throttling that would drop
+// genuine play history.
+//
+// `trust proxy` is required because Render terminates TLS in front of this
+// process — without it every request appears to come from the proxy's IP and
+// one visitor would exhaust the budget for everybody.
+app.set('trust proxy', 1);
+
+// Shared by every limiter: a JSON 429 in the shape the frontend already
+// understands, so `new Error(body.error)` surfaces something readable.
+function rateLimited(_req, res) {
+  res.status(429).json({ error: 'Too many attempts. Please wait a moment and try again.' });
+}
+
+// Code guessing surface: someone could brute-force short student/teacher codes.
+// Windows are generous because a whole class behind ONE school NAT shares an
+// IP, so a tight per-IP cap would lock out legitimate students.
+const codeLookupLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  limit: 60,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  handler: rateLimited,
+});
+
+const loginLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  limit: 40,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  handler: rateLimited,
+});
+
+// Play logging is fire-and-forget from games; the cap exists only to stop a
+// runaway loop, so it sits far above any realistic classroom burst.
+const playsLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 120,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  handler: rateLimited,
+});
+
+const feedbackLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  handler: rateLimited,
+});
+
 // truth for teacher auth.
-app.post('/api/teacher-login', async (req, res) => {
+app.post('/api/teacher-login', loginLimiter, async (req, res) => {
   try {
     const { code } = req.body;
     const teacher = await lookupTeacher(code);
@@ -1132,10 +1219,36 @@ async function requireClass(req, res) {
 // (Render cold-starts, no cron in this app). Idempotent: the filter only
 // matches rows that are still locked with a due time, so a repeat call is a
 // no-op rather than a re-unlock.
+// Tracks, per class, the soonest unlock time we know is still pending, so
+// resolveDueUnlocks() can skip its write while a schedule is comfortably in
+// the future — the overwhelmingly common case.
+//
+// Module-scope and therefore per-process: Render may run more than one
+// instance. This is a cache for SKIPPING WORK, never a source of truth.
+// getGameAccessRows() re-reads from Mongo on every request regardless, and the
+// guard below re-sweeps at least every 30 s, so a stale entry can only cost an
+// unnecessary (idempotent) sweep — never correctness.
+const pendingUnlockCache = new Map(); // classId -> soonest pending unlockAt (ms)
+const UNLOCK_SWEEP_INTERVAL_MS = 30_000;
+
 async function resolveDueUnlocks(classId) {
+  const now = Date.now();
+  const cachedSoonest = pendingUnlockCache.get(classId);
+
+  // Fast path — skip the UPDATE entirely when the soonest pending unlock is
+  // comfortably in the future. This is the path taken on virtually every
+  // homepage load, and it removes a write query from the hottest read path.
+  if (
+    cachedSoonest !== undefined &&
+    cachedSoonest !== null &&
+    cachedSoonest > now + UNLOCK_SWEEP_INTERVAL_MS
+  ) {
+    return;
+  }
+
   // $ne:null is required — in BSON ordering null sorts below Date, so a bare
   // $lte would match every unscheduled (null) row.
-  await GameAccess.updateMany(
+  const result = await GameAccess.updateMany(
     {
       classId,
       added: true,
@@ -1144,6 +1257,33 @@ async function resolveDueUnlocks(classId) {
     },
     { $set: { unlocked: true, unlockAt: null, updatedAt: new Date() } }
   );
+
+  // Refresh the cache from the rows we just swept, but only when something
+  // actually changed — otherwise getGameAccessRows() will set it from the rows
+  // it is already loading, with no extra query.
+  if (result.modifiedCount > 0) {
+    const next = await GameAccess.findOne({
+      classId,
+      added: true,
+      unlocked: false,
+      unlockAt: { $ne: null },
+    })
+      .sort({ unlockAt: 1 })
+      .select('unlockAt')
+      .lean();
+    pendingUnlockCache.set(classId, next ? new Date(next.unlockAt).getTime() : null);
+  } else if (cachedSoonest === undefined) {
+    // First sweep for this class with nothing due — record that, so the next
+    // read can take the fast path instead of sweeping again.
+    pendingUnlockCache.set(classId, null);
+  }
+}
+
+// Invalidates the cached pending unlock for a class after ANY write that could
+// change it (schedule set, unlock, lock, catalogue add/remove). Without this a
+// newly scheduled game could sit behind a stale "nothing due" cache entry.
+function invalidateUnlockCache(classId) {
+  pendingUnlockCache.delete(classId);
 }
 
 // Returns the game arrangement for a given classId. Uses .lean() for
@@ -1155,6 +1295,15 @@ async function getGameAccessRows(classId) {
   // filters to known games, and the DB is the source of truth for what has
   // been added to a class. New games work with zero server edits.
   const docs = await GameAccess.find({ classId, added: true }).lean();
+
+  // Keep the skip-guard accurate using rows we already had to load, so the
+  // next read of this class can take the fast path in resolveDueUnlocks().
+  const nowMs = Date.now();
+  const futureUnlocks = docs
+    .filter((doc) => !doc.unlocked && doc.unlockAt && new Date(doc.unlockAt).getTime() > nowMs)
+    .map((doc) => new Date(doc.unlockAt).getTime());
+  pendingUnlockCache.set(classId, futureUnlocks.length ? Math.min(...futureUnlocks) : null);
+
   return docs
     .map((doc) => ({
       gameKey: doc.gameKey,
@@ -1392,6 +1541,9 @@ app.post('/api/game-access/:gameKey', async (req, res) => {
       { upsert: true, new: true }
     );
 
+    // Adding a game changes what could be scheduled, so the skip-guard must
+    // not keep serving a stale "nothing pending" answer for this class.
+    invalidateUnlockCache(classId);
     res.status(201).json({ ok: true, rows: await getGameAccessRows(classId) });
   } catch (err) {
     console.error(err);
@@ -1433,6 +1585,7 @@ app.delete('/api/game-access/:gameKey', async (req, res) => {
     );
 
     if (!doc) return res.status(404).json({ error: 'This game is not in the class' });
+    invalidateUnlockCache(classId);
     res.json({ ok: true, rows: await getGameAccessRows(classId) });
   } catch (err) {
     console.error(err);
@@ -1533,6 +1686,7 @@ app.put('/api/game-access/:gameKey/schedule', async (req, res) => {
       });
     }
 
+    invalidateUnlockCache(classId);
     res.json({ ok: true, rows: await getGameAccessRows(classId) });
   } catch (err) {
     console.error(err);
@@ -1576,6 +1730,10 @@ app.put('/api/game-access/:gameKey', async (req, res) => {
     );
 
     if (!doc) return res.status(404).json({ error: 'Add this game to the class first' });
+
+    // Lock/unlock state decides whether an unlock is still pending — most
+    // importantly, an early unlock clears the schedule.
+    invalidateUnlockCache(classId);
 
     res.json({
       ok: true,
@@ -1785,7 +1943,7 @@ if (!process.env.RESEND_API_KEY) {
   );
 }
 
-app.post('/api/feedback', async (req, res) => {
+app.post('/api/feedback', feedbackLimiter, async (req, res) => {
   try {
     const body = req.body || {};
 
@@ -1955,7 +2113,7 @@ app.post('/api/codes/check', async (req, res) => {
 });
 
 // Classifies a code into exactly one identity kind so the login flow can branch.
-app.post('/api/code-lookup', async (req, res) => {
+app.post('/api/code-lookup', codeLookupLimiter, async (req, res) => {
   try {
     const code = (req.body.code || '').toString().trim();
     if (!code) return res.status(400).json({ error: 'code is required' });
@@ -2023,7 +2181,7 @@ app.post('/api/code-lookup', async (req, res) => {
 // POST /api/student-login v2 — supports both login modes:
 //   mode A: { studentCode }        → rostered/private login
 //   mode B: { name, classCode }    → public "light" login
-app.post('/api/student-login', async (req, res) => {
+app.post('/api/student-login', loginLimiter, async (req, res) => {
   try {
     const { studentCode, name: rawName, classCode } = req.body;
 
@@ -2092,7 +2250,7 @@ app.post('/api/student-login', async (req, res) => {
 });
 
 // Log one completed play session.
-app.post('/api/plays', async (req, res) => {
+app.post('/api/plays', playsLimiter, async (req, res) => {
   try {
     const {
       game,
