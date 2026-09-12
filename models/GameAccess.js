@@ -11,6 +11,13 @@ const gameAccessSchema = new mongoose.Schema({
   added: { type: Boolean, default: false },
   unlocked: { type: Boolean, default: false },
 
+  // When set, this game is due to auto-unlock at this instant. A scheduled row
+  // is always locked in the meantime, so this only ever coexists with
+  // unlocked:false. The unlock is applied lazily on read (see
+  // resolveDueUnlocks in server.js) rather than by a cron, so it still fires
+  // correctly after the server has slept through the exact minute.
+  unlockAt: { type: Date, default: null },
+
   // Zero-based order in the admin panel and homepage.
   order: { type: Number, default: 0 },
 

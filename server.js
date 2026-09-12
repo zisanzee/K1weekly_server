@@ -1061,9 +1061,30 @@ async function requireClass(req, res) {
   return classId;
 }
 
+// Applies any scheduled unlock whose time has passed. Run lazily on every read
+// so a schedule still fires even if the server slept through the exact minute
+// (Render cold-starts, no cron in this app). Idempotent: the filter only
+// matches rows that are still locked with a due time, so a repeat call is a
+// no-op rather than a re-unlock.
+async function resolveDueUnlocks(classId) {
+  // $ne:null is required — in BSON ordering null sorts below Date, so a bare
+  // $lte would match every unscheduled (null) row.
+  await GameAccess.updateMany(
+    {
+      classId,
+      added: true,
+      unlocked: false,
+      unlockAt: { $ne: null, $lte: new Date() },
+    },
+    { $set: { unlocked: true, unlockAt: null, updatedAt: new Date() } }
+  );
+}
+
 // Returns the game arrangement for a given classId. Uses .lean() for
 // performance — plain objects, no Mongoose document overhead.
 async function getGameAccessRows(classId) {
+  await resolveDueUnlocks(classId);
+
   // No hardcoded game-key allowlist — the frontend GAME_CATALOG already
   // filters to known games, and the DB is the source of truth for what has
   // been added to a class. New games work with zero server edits.
@@ -1074,6 +1095,10 @@ async function getGameAccessRows(classId) {
       unlocked: Boolean(doc.unlocked),
       shiny: Boolean(doc.shiny),
       order: Number.isInteger(doc.order) ? doc.order : 0,
+      // Only a still-pending schedule is meaningful to the client; an
+      // already-unlocked row is reported with unlockAt:null so the countdown
+      // UI can never latch onto a time that has already passed.
+      unlockAt: doc.unlockAt ? new Date(doc.unlockAt).toISOString() : null,
       updatedBy: doc.updatedBy,
       updatedAt: doc.updatedAt,
     }))
@@ -1290,6 +1315,9 @@ app.post('/api/game-access/:gameKey', async (req, res) => {
           unlocked: false,
           shiny: false,
           order,
+          // A re-added game starts clean, so any schedule left over from its
+          // previous life in the class is discarded.
+          unlockAt: null,
           updatedBy: actor.name,
           updatedAt: new Date(),
         },
@@ -1328,6 +1356,9 @@ app.delete('/api/game-access/:gameKey', async (req, res) => {
           added: false,
           unlocked: false,
           shiny: false,
+          // Removing the game removes its pending unlock with it; a removed
+          // game must not surface in the students' countdown.
+          unlockAt: null,
           updatedBy: actor.name,
           updatedAt: new Date(),
         },
@@ -1389,6 +1420,60 @@ app.put('/api/game-access/:gameKey/shiny', async (req, res) => {
   }
 });
 
+// Admin OR own-class teacher: schedules a locked game to unlock at a future
+// time. Scheduling an unlocked game is rejected — there is nothing left to
+// wait for, and the panel hides the control in that state anyway.
+// Must stay above /api/game-access/:gameKey by convention with its siblings.
+app.put('/api/game-access/:gameKey/schedule', async (req, res) => {
+  try {
+    const { gameKey } = req.params;
+    const { unlockAt } = req.body;
+    const classId = (req.body.classId || '').toString().trim();
+    if (!classId) {
+      return res.status(400).json({ error: 'A valid classId is required' });
+    }
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    if (!GAME_KEY_RE.test(gameKey)) {
+      return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
+    }
+
+    const when = new Date(unlockAt);
+    if (!unlockAt || Number.isNaN(when.getTime())) {
+      return res.status(400).json({ error: 'A valid unlock time is required' });
+    }
+    // A past time would mean the countdown never shows and the next read
+    // silently unlocks — reject it so the teacher fixes the input instead.
+    if (when.getTime() <= Date.now()) {
+      return res.status(400).json({ error: 'Pick a time in the future' });
+    }
+
+    const doc = await GameAccess.findOneAndUpdate(
+      { classId, gameKey, added: true, unlocked: false },
+      {
+        $set: {
+          unlockAt: when,
+          updatedBy: actor.name,
+          updatedAt: new Date(),
+        },
+      },
+      { new: true }
+    );
+
+    if (!doc) {
+      return res.status(409).json({
+        error: 'Only a locked game can be scheduled to unlock',
+      });
+    }
+
+    res.json({ ok: true, rows: await getGameAccessRows(classId) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not schedule this unlock' });
+  }
+});
+
 // Admin OR own-class teacher: locks or unlocks one game for a class.
 app.put('/api/game-access/:gameKey', async (req, res) => {
   try {
@@ -1408,15 +1493,19 @@ app.put('/api/game-access/:gameKey', async (req, res) => {
       return res.status(400).json({ error: 'unlocked must be true or false' });
     }
 
+    const update = {
+      unlocked,
+      updatedBy: actor.name,
+      updatedAt: new Date(),
+    };
+    // Unlocking early scraps the pending schedule — the teacher just did the
+    // thing the schedule was going to do, so waiting on it would be wrong.
+    // Locking leaves any schedule alone.
+    if (unlocked) update.unlockAt = null;
+
     const doc = await GameAccess.findOneAndUpdate(
       { classId, gameKey, added: true },
-      {
-        $set: {
-          unlocked,
-          updatedBy: actor.name,
-          updatedAt: new Date(),
-        },
-      },
+      { $set: update },
       { new: true }
     );
 
@@ -1428,6 +1517,7 @@ app.put('/api/game-access/:gameKey', async (req, res) => {
       unlocked: doc.unlocked,
       shiny: Boolean(doc.shiny),
       order: doc.order,
+      unlockAt: doc.unlockAt ? new Date(doc.unlockAt).toISOString() : null,
       updatedBy: doc.updatedBy,
     });
   } catch (err) {
