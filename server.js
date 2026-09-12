@@ -798,6 +798,72 @@ app.delete('/api/classes/:classId/students/:studentId', async (req, res) => {
   }
 });
 
+// Deletes a name-only ("light") identity — a public-class kid who only ever gave
+// a name and therefore has no Student row to delete. The only thing that makes
+// the identity exist is its play sessions, so removing those removes the row.
+// Both the teacher's live class structure AND the player's resolved classId are
+// matched, since the two are not guaranteed to be the same string (unlike every
+// other endpoint here, which can trust a single classId).
+app.delete('/api/classes/:classId/identities/:name', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    // Express has already URL-decoded the param — decoding again would throw on
+    // a legitimate name containing a literal '%' (e.g. "100%").
+    const name = (req.params.name || '').trim();
+    if (!name) {
+      return res.status(400).json({ error: 'A player name is required' });
+    }
+
+    const classIds = [...new Set([classId, actor.classId].filter(Boolean))];
+
+    // Safety net: never delete a name that is still a real roster student, even
+    // if the caller asked for it — the server is the boundary and the UI must
+    // not be able to turn a rostered student into a bare play-history wipe.
+    const rostered = await Student.findOne({
+      classId: { $in: classIds },
+      $or: [{ nickname: name }, { fullName: name }],
+    })
+      .select('_id')
+      .lean();
+    if (rostered) {
+      return res.status(409).json({
+        error: 'This identity belongs to a roster student. Delete the student instead.',
+      });
+    }
+
+    // A remaining active merge would keep deleting it from the merged list, so
+    // clear the name out of any merge group and deactivate the group if that
+    // empties it.
+    const merges = await PlayerMerge.find({
+      classId: { $in: classIds },
+      active: true,
+      members: name,
+    });
+    for (const merge of merges) {
+      merge.members = merge.members.filter((member) => member !== name);
+      if (merge.members.length === 0) merge.active = false;
+      await merge.save();
+    }
+
+    const result = await PlaySession.deleteMany({
+      classId: { $in: classIds },
+      playerName: name,
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: 'That identity has no play history to delete' });
+    }
+
+    res.json({ ok: true, name, deletedPlays: result.deletedCount });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not delete this identity' });
+  }
+});
+
 // Merge 2+ name-identities within one class into a primary. Light public-class
 // kids only ever gave a name, so merges are name-based (roster students fold in
 // when their name matches). Sessions are physically retagged to the primary
