@@ -1640,8 +1640,16 @@ app.put('/api/game-access/:gameKey/shiny', async (req, res) => {
 });
 
 // Admin OR own-class teacher: schedules a locked game to unlock at a future
-// time. Scheduling an unlocked game is rejected — there is nothing left to
-// wait for, and the panel hides the control in that state anyway.
+// time, or cancels an existing schedule.
+//
+// PUT with `unlockAt: null` (or '') CANCELS the pending schedule: it clears the
+// field and leaves the game exactly as locked as it was. This is deliberately
+// not expressible as a "past time" — a past time is rejected below, and before
+// cancel existed the only way to remove a schedule was to unlock the game early,
+// which is a different (and destructive) intent.
+//
+// Scheduling an unlocked game is rejected — there is nothing left to wait for,
+// and the panel hides the control in that state anyway.
 // Must stay above /api/game-access/:gameKey by convention with its siblings.
 app.put('/api/game-access/:gameKey/schedule', async (req, res) => {
   try {
@@ -1658,8 +1666,32 @@ app.put('/api/game-access/:gameKey/schedule', async (req, res) => {
       return res.status(400).json({ error: `Invalid gameKey: "${gameKey}"` });
     }
 
+    // Explicit cancel. `null`/undefined/'' all read as "clear it", so the
+    // frontend can send whichever is natural without the server caring.
+    const isCancel = unlockAt === null || unlockAt === undefined || unlockAt === '';
+
+    if (isCancel) {
+      // Scoped to `unlockAt: { $ne: null }` so a cancel is a no-op (404) rather
+      // than a silent write on a game that was never scheduled — that also
+      // keeps `updatedBy`/`updatedAt` meaningful.
+      const cleared = await GameAccess.findOneAndUpdate(
+        { classId, gameKey, added: true, unlocked: false, unlockAt: { $ne: null } },
+        {
+          $set: { unlockAt: null, updatedBy: actor.name, updatedAt: new Date() },
+        },
+        { new: true }
+      );
+
+      if (!cleared) {
+        return res.status(404).json({ error: 'This game has no scheduled unlock' });
+      }
+
+      invalidateUnlockCache(classId);
+      return res.json({ ok: true, rows: await getGameAccessRows(classId) });
+    }
+
     const when = new Date(unlockAt);
-    if (!unlockAt || Number.isNaN(when.getTime())) {
+    if (Number.isNaN(when.getTime())) {
       return res.status(400).json({ error: 'A valid unlock time is required' });
     }
     // A past time would mean the countdown never shows and the next read
