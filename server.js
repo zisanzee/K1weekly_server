@@ -2391,12 +2391,22 @@ const LIST_LIMIT_MAX = 200;
 // Read-only whitelists of the sort columns each list may be ordered by — any
 // other value falls back to that list's default so a bad query can't inject
 // an arbitrary sort expression.
-const SUMMARY_SORT_KEYS = new Set(['playerName', 'game', 'bestStreak', 'lastPlayedAt']);
+// `totalMistakes` / `mistakes` are the headline sort now that wrong answers
+// replaced score — the panel sorts by them so a teacher can surface who needs
+// help first.
+const SUMMARY_SORT_KEYS = new Set([
+  'playerName',
+  'game',
+  'bestStreak',
+  'totalMistakes',
+  'lastPlayedAt',
+]);
 const PLAYS_SORT_KEYS = new Set([
   'playerName',
   'game',
   'stars',
   'peakStreak',
+  'mistakes',
   'completedAt',
   'deviceKind',
 ]);
@@ -2453,6 +2463,17 @@ app.get('/api/stats', async (req, res) => {
                 _id: '$game',
                 plays: { $sum: 1 },
                 avgStars: { $avg: '$stars' },
+                // Wrong answers per play. The headline metric now — `stars`
+                // turned out to be a poor signal because a player can't clear
+                // a round without answering correctly, so it always reached max.
+                //
+                // CAVEAT: this average is skewed LOW by history. `mistakes`
+                // carries a schema default of 0, so plays recorded before a game
+                // started reporting it are stored as a clean zero rather than
+                // being absent — $avg counts them, it doesn't skip them. Games
+                // 1/2/3/5/6 only began reporting in this change, so their
+                // averages climb toward the truth as new plays come in.
+                avgMistakes: { $avg: '$mistakes' },
                 bestStreak: { $max: '$peakStreak' },
                 // elapsedSeconds only exists on bonus/time-trial plays and
                 // $avg ignores docs missing it, so this is the per-play
@@ -2538,6 +2559,13 @@ app.get('/api/summary', async (req, res) => {
           lastStars: { $last: '$stars' },
           totalRounds: { $last: '$totalRounds' },
           bestStreak: { $max: '$peakStreak' },
+          // Mistakes are summed across the player's plays rather than averaged:
+          // the row is "how many wrong answers has this player given in this
+          // game", which is what the panel actually shows.
+          //
+          // Same history caveat as avgMistakes: pre-tracking plays store the
+          // schema default of 0, so an old row's total understates the truth.
+          totalMistakes: { $sum: '$mistakes' },
           lastPlayedAt: { $max: '$completedAt' },
         },
       },
@@ -2551,6 +2579,7 @@ app.get('/api/summary', async (req, res) => {
           lastStars: 1,
           totalRounds: 1,
           bestStreak: 1,
+          totalMistakes: 1,
           lastPlayedAt: 1,
         },
       },
@@ -2870,6 +2899,12 @@ async function computeClassStats(classId) {
               _id: '$game',
               plays: { $sum: 1 },
               avgStars: { $avg: '$stars' },
+              // Wrong answers per play — the headline metric, since `stars`
+              // always reached max (a round can't be cleared without a correct
+              // answer). See the note on the /api/stats facet: the schema
+              // default of 0 means pre-tracking plays count as clean, so this
+              // reads low on older data.
+              avgMistakes: { $avg: '$mistakes' },
               bestStreak: { $max: '$peakStreak' },
               avgElapsedSeconds: { $avg: '$elapsedSeconds' },
             },
