@@ -2398,7 +2398,7 @@ const SUMMARY_SORT_KEYS = new Set([
   'playerName',
   'game',
   'bestStreak',
-  'totalMistakes',
+  'avgMistakes',
   'lastPlayedAt',
 ]);
 const PLAYS_SORT_KEYS = new Set([
@@ -2559,13 +2559,16 @@ app.get('/api/summary', async (req, res) => {
           lastStars: { $last: '$stars' },
           totalRounds: { $last: '$totalRounds' },
           bestStreak: { $max: '$peakStreak' },
-          // Mistakes are summed across the player's plays rather than averaged:
-          // the row is "how many wrong answers has this player given in this
-          // game", which is what the panel actually shows.
+          // Wrong answers PER PLAY, not summed. A total only grows with how
+          // often the child has played, so it made a frequent player look
+          // worse than an equally-accurate occasional one — the opposite of
+          // what a teacher is scanning for. `timesPlayed` is in the same
+          // group, so it can be derived here rather than counted client-side.
           //
-          // Same history caveat as avgMistakes: pre-tracking plays store the
-          // schema default of 0, so an old row's total understates the truth.
-          totalMistakes: { $sum: '$mistakes' },
+          // History caveat: pre-tracking plays store the schema default of 0,
+          // so they count as clean runs and drag this down until enough new
+          // plays accumulate.
+          avgMistakes: { $avg: '$mistakes' },
           lastPlayedAt: { $max: '$completedAt' },
         },
       },
@@ -2579,7 +2582,7 @@ app.get('/api/summary', async (req, res) => {
           lastStars: 1,
           totalRounds: 1,
           bestStreak: 1,
-          totalMistakes: 1,
+          avgMistakes: 1,
           lastPlayedAt: 1,
         },
       },
