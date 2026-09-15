@@ -13,7 +13,11 @@ async function lookupTeacher(code) {
   const trimmed = (code || '').toString().trim();
   if (!trimmed) return null;
 
-  const teacher = await Teacher.findOne({ code: trimmed }).lean();
+  // `active: { $ne: false }` — not `active: true`. Teachers are soft-deactivated
+  // (never deleted) so historical stats keep resolving; a deactivated code must
+  // therefore stop authenticating here, or "removed" teachers would retain full
+  // access. The $ne form keeps legacy rows with no `active` field working.
+  const teacher = await Teacher.findOne({ code: trimmed, active: { $ne: false } }).lean();
   if (!teacher) return null;
 
   const classInfo = await ClassInfo.findOne({ classId: teacher.classId }).lean();

@@ -565,6 +565,126 @@ app.patch('/api/classes/:classId/code', async (req, res) => {
   }
 });
 
+// Teacher (own class) OR admin: edit the descriptive class fields a teacher is
+// trusted with. Deliberately a SEPARATE route from the admin-only PUT above —
+// that one also replaces the whole teacher list, which a teacher must never
+// reach. classCode stays on its own endpoint, and isPublic on its own, so each
+// concern keeps its own confirmation flow.
+app.patch('/api/classes/:classId/details', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    const classInfo = await ClassInfo.findOne({ classId });
+    if (!classInfo) return res.status(404).json({ error: 'Class not found' });
+
+    if ('className' in req.body) {
+      const className = (req.body.className || '').toString().trim().slice(0, 80);
+      if (!className) {
+        return res.status(400).json({ error: 'Class name cannot be empty' });
+      }
+      classInfo.className = className;
+    }
+    if ('classAlias' in req.body) {
+      // Falls back to the class name when cleared, matching the admin editor.
+      classInfo.classAlias =
+        (req.body.classAlias || '').toString().trim().slice(0, 80) ||
+        classInfo.className;
+    }
+    if ('classYear' in req.body) {
+      classInfo.classYear =
+        (req.body.classYear || '').toString().trim().slice(0, 20) || null;
+    }
+
+    await classInfo.save();
+    res.json({ ok: true, classInfo: classInfoPayload(classInfo) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not update class information' });
+  }
+});
+
+// A teacher editing THEIR OWN name and/or access code.
+//
+// The code is the only credential this app has, so a change is guarded by
+// re-supplying the current one — knowing the session's own code is the proof of
+// identity, and it stops a walk-up change on an unlocked device. The client also
+// makes them type the new code twice, but that is only convenience; the check
+// that matters is the currentCode comparison here.
+app.patch('/api/teachers/me', async (req, res) => {
+  try {
+    const actor = await requireTeacher(req, res);
+    if (!actor) return;
+
+    // Re-read as a document — requireTeacher returns a lean projection without
+    // the _id needed to exclude this row from the uniqueness check.
+    const teacher = await Teacher.findOne({ code: actor.code });
+    if (!teacher) return res.status(404).json({ error: 'Teacher not found' });
+
+    // The single admin row's code is pinned to the ADMIN_CODE env var: the boot
+    // migration downgrades any role:'admin' record whose code is not that value,
+    // so renaming it here would be silently reverted (and could strand the
+    // operator). Admin credentials are rotated by changing the env var instead.
+    if (teacher.role === 'admin') {
+      return res
+        .status(403)
+        .json({ error: 'The admin code is managed by the server environment and cannot be changed here' });
+    }
+
+    if ('name' in req.body) {
+      const name = (req.body.name || '').toString().trim().slice(0, 80);
+      if (!name) return res.status(400).json({ error: 'Your name cannot be empty' });
+      teacher.name = name;
+    }
+
+    const newCode = (req.body.newCode || '').toString().trim();
+    if (newCode) {
+      const currentCode = (req.body.currentCode || '').toString().trim();
+
+      if (!currentCode || currentCode !== teacher.code) {
+        return res.status(401).json({ error: 'Your current code is incorrect' });
+      }
+      if (!/^[A-Za-z0-9_-]{4,60}$/.test(newCode)) {
+        return res.status(400).json({
+          error: 'Your new code must be 4–60 characters, using letters, numbers, - or _ only',
+        });
+      }
+      // Trimmed both sides: a pasted " ABC123 " must not be accepted with the
+      // whitespace — the login path trims too, so the stored value has to match
+      // what will actually be typed next time.
+      if (newCode === (teacher.code || '').trim()) {
+        return res.status(400).json({ error: 'That is already your code' });
+      }
+
+      const conflict = await findCodeOwner(newCode, { teacherId: teacher._id });
+      if (conflict) {
+        return res
+          .status(409)
+          .json({ error: `The code "${newCode}" is already taken`, reason: conflict });
+      }
+      teacher.code = newCode;
+    }
+
+    await teacher.save();
+
+    // Return the same identity shape as /api/teacher-login so the client can
+    // swap its stored credential and stay signed in (a code change would
+    // otherwise sign the device out on its next validation).
+    const identity = await lookupTeacher(teacher.code);
+    res.json({ ok: true, teacher: identity });
+  } catch (err) {
+    // findCodeOwner() closes the common race, but two simultaneous renames to
+    // the same free code can still slip past it and collide on the unique
+    // index. That is a conflict, not a server fault — report it as one.
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'That code is already taken' });
+    }
+    console.error(err);
+    res.status(500).json({ error: 'Could not update your profile' });
+  }
+});
+
 // Roster for a class — teacher-only, same gating style as /api/stats.
 app.get('/api/students', async (req, res) => {
   try {
@@ -1812,6 +1932,10 @@ function classInfoPayload(classroom) {
     classId: classroom.classId,
     className: classroom.className,
     classAlias: classroom.classAlias || classroom.className,
+    // Included so a caller that round-trips this payload back into an edit form
+    // doesn't blank the year. GET /api/classes/:classId has always returned it;
+    // this shared payload used to omit it, which quietly dropped it.
+    classYear: classroom.classYear || null,
     classCode: classroom.classCode || null,
     classType: classroom.classType || 'k1',
     isPublic: Boolean(classroom.isPublic),
@@ -2155,8 +2279,12 @@ app.post('/api/code-lookup', codeLookupLimiter, async (req, res) => {
       return res.json({ kind: 'adminCode', name: ADMIN_NAME, role: 'admin' });
     }
 
-    // 2. Teacher code.
-    const teacher = await Teacher.findOne({ code }).lean();
+    // 2. Teacher code. Deactivated teachers are excluded — same rule as
+    // lookupTeacher(), so a code the admin removed cannot still be classified
+    // as a valid teacher identity here. If it falls through it simply matches
+    // nothing else (the namespace forbids a code living in two buckets) and the
+    // caller reports an unrecognised code.
+    const teacher = await Teacher.findOne({ code, active: { $ne: false } }).lean();
     if (teacher) {
       const classInfo = teacher.classId
         ? await ClassInfo.findOne({ classId: teacher.classId }).lean()
