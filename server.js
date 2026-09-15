@@ -691,7 +691,7 @@ app.get('/api/students', async (req, res) => {
     const teacher = await requireTeacher(req, res);
     if (!teacher) return;
 
-    const students = await Student.find({ classId: teacher.classId })
+    const students = await Student.find({ classId: teacher.classId, deletedAt: null })
       .sort({ createdAt: 1 })
       .select('studentId fullName nickname group code -_id');
 
@@ -789,6 +789,9 @@ app.put('/api/students/:studentId', async (req, res) => {
 });
 
 // Remove a student from the roster. Teacher-only, scoped to their own class.
+// Soft-delete: the row and its play history are marked, not destroyed, so the
+// removal can be undone (see .../restore) and only becomes permanent from the
+// trash list.
 app.delete('/api/students/:studentId', async (req, res) => {
   try {
     const teacher = await requireTeacher(req, res);
@@ -805,10 +808,14 @@ app.delete('/api/students/:studentId', async (req, res) => {
       return res.status(404).json({ error: 'Student not found in your class' });
     }
 
-    await Student.deleteOne({ _id: student._id });
-    await removeStudentPlaySessions(teacher.classId, student);
+    const now = new Date();
+    await Student.updateOne(
+      { _id: student._id },
+      { $set: { deletedAt: now, deletedBy: teacher.code } }
+    );
+    await softDeleteStudentPlaySessions(teacher.classId, student, teacher.code);
 
-    res.json({ ok: true });
+    res.json({ ok: true, deletedAt: now.toISOString() });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not delete student' });
@@ -831,10 +838,12 @@ app.get('/api/classes/:classId/identities', async (req, res) => {
     if (!actor) return;
 
     const [students, names] = await Promise.all([
-      Student.find({ classId, mergedInto: null })
+      Student.find({ classId, mergedInto: null, deletedAt: null })
         .select('studentId nickname fullName code -_id')
         .lean(),
-      PlaySession.distinct('playerName', { classId }),
+      // Reuses the same NOT_DELETED filter as stats/leaderboards, so a removed
+      // player's name can't resurface here as a bare "light" identity.
+      PlaySession.distinct('playerName', { classId, ...NOT_DELETED }),
     ]);
 
     const byName = new Map();
@@ -866,7 +875,7 @@ app.get('/api/classes/:classId/students', async (req, res) => {
     const actor = await requireClassAccess(req, res, classId);
     if (!actor) return;
 
-    const students = await Student.find({ classId })
+    const students = await Student.find({ classId, deletedAt: null })
       .sort({ createdAt: 1 })
       .select('studentId fullName nickname group code mergedInto mergedAt -_id')
       .lean();
@@ -984,6 +993,8 @@ app.put('/api/classes/:classId/students/:studentId', async (req, res) => {
   }
 });
 
+// Remove a student (soft). The row keeps its code and stays recoverable until
+// it is permanently deleted from the trash list.
 app.delete('/api/classes/:classId/students/:studentId', async (req, res) => {
   try {
     const { classId, studentId } = req.params;
@@ -994,14 +1005,123 @@ app.delete('/api/classes/:classId/students/:studentId', async (req, res) => {
     if (!student) {
       return res.status(404).json({ error: 'Student not found in this class' });
     }
+    if (student.deletedAt) {
+      return res.status(409).json({ error: 'This student is already deleted' });
+    }
 
-    await Student.deleteOne({ _id: student._id });
-    await removeStudentPlaySessions(classId, student);
+    const now = new Date();
+    await Student.updateOne(
+      { _id: student._id },
+      { $set: { deletedAt: now, deletedBy: actor.code } }
+    );
+    const hiddenSessions = await softDeleteStudentPlaySessions(
+      classId,
+      student,
+      actor.code
+    );
 
-    res.json({ ok: true });
+    // Returned so the client can offer an immediate undo without a refetch.
+    res.json({
+      ok: true,
+      studentId,
+      deletedAt: now.toISOString(),
+      hiddenSessions,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not delete student' });
+  }
+});
+
+// Deleted students for a class — the trash list.
+app.get('/api/classes/:classId/students/deleted', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    const students = await Student.find({ classId, deletedAt: { $ne: null } })
+      .sort({ deletedAt: -1 })
+      .select('studentId nickname fullName code deletedAt deletedBy -_id')
+      .lean();
+
+    res.json(
+      students.map((s) => ({
+        studentId: s.studentId,
+        name: s.nickname || s.fullName || 'Unnamed',
+        code: s.code || null,
+        deletedAt: s.deletedAt,
+        deletedBy: s.deletedBy || null,
+      }))
+    );
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load deleted students' });
+  }
+});
+
+// Undo a removal: clears the marker on the student and on their play history,
+// so they reappear in the roster and in every stats view exactly as before.
+app.post('/api/classes/:classId/students/:studentId/restore', async (req, res) => {
+  try {
+    const { classId, studentId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    const student = await Student.findOne({ studentId, classId }).lean();
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found in this class' });
+    }
+    if (!student.deletedAt) {
+      return res.status(409).json({ error: 'This student is not deleted' });
+    }
+
+    await Student.updateOne(
+      { _id: student._id },
+      { $set: { deletedAt: null, deletedBy: null } }
+    );
+    const restoredSessions = await restoreStudentPlaySessions(classId, student);
+
+    res.json({ ok: true, studentId, restoredSessions });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not restore student' });
+  }
+});
+
+// Permanently delete a student. Only reachable from the trash list, so a normal
+// removal can never destroy data by accident — this is the explicit second step.
+app.delete('/api/classes/:classId/students/:studentId/permanent', async (req, res) => {
+  try {
+    const { classId, studentId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    const student = await Student.findOne({ studentId, classId }).lean();
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found in this class' });
+    }
+    // Require that it is already in the trash — this endpoint must never be used
+    // as a one-shot destructive delete.
+    if (!student.deletedAt) {
+      return res.status(409).json({
+        error: 'Remove the student first, then delete them permanently from the deleted list.',
+      });
+    }
+
+    const names = [student.nickname, student.fullName]
+      .map((n) => (n || '').toString().trim())
+      .filter(Boolean);
+
+    await Student.deleteOne({ _id: student._id });
+    if (names.length > 0) {
+      await PlaySession.deleteMany({ classId, playerName: { $in: names } });
+    }
+
+    res.json({ ok: true, studentId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not permanently delete student' });
   }
 });
 
@@ -1029,8 +1149,11 @@ app.delete('/api/classes/:classId/identities/:name', async (req, res) => {
     // Safety net: never delete a name that is still a real roster student, even
     // if the caller asked for it — the server is the boundary and the UI must
     // not be able to turn a rostered student into a bare play-history wipe.
+    // `deletedAt: null` so a REMOVED roster student doesn't block cleanup here —
+    // their own sessions are already hidden by the student delete.
     const rostered = await Student.findOne({
       classId: { $in: classIds },
+      deletedAt: null,
       $or: [{ nickname: name }, { fullName: name }],
     })
       .select('_id')
@@ -1055,19 +1178,45 @@ app.delete('/api/classes/:classId/identities/:name', async (req, res) => {
       await merge.save();
     }
 
-    const result = await PlaySession.deleteMany({
-      classId: { $in: classIds },
-      playerName: name,
-    });
+    // Soft: the name-only identity is hideable and restorable just like a
+    // roster student, so an accidental tap on a child's name can be undone.
+    const result = await PlaySession.updateMany(
+      { classId: { $in: classIds }, playerName: name, deletedAt: null },
+      { $set: { deletedAt: new Date(), deletedBy: actor.code || null } }
+    );
 
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ error: 'That identity has no play history to delete' });
+    if (result.modifiedCount === 0) {
+      return res.status(404).json({ error: 'That identity has no play history to remove' });
     }
 
-    res.json({ ok: true, name, deletedPlays: result.deletedCount });
+    res.json({ ok: true, name, hiddenPlays: result.modifiedCount });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not delete this identity' });
+  }
+});
+
+// Undo removing a name-only identity: unhide its play history so the name
+// reappears in the roster and in the stats.
+app.post('/api/classes/:classId/identities/:name/restore', async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    const name = (req.params.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'A player name is required' });
+
+    const classIds = [...new Set([classId, actor.classId].filter(Boolean))];
+    const result = await PlaySession.updateMany(
+      { classId: { $in: classIds }, playerName: name, deletedAt: { $ne: null } },
+      { $set: { deletedAt: null, deletedBy: null } }
+    );
+
+    res.json({ ok: true, name, restoredPlays: result.modifiedCount });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not restore this identity' });
   }
 });
 
@@ -1269,7 +1418,9 @@ app.get('/api/student-login/:code', async (req, res) => {
       return res.status(400).json({ error: 'Invalid student code' });
     }
 
-    const student = await Student.findOne({ code })
+    // `deletedAt: null` — a soft-removed student must not be able to log in
+    // with the code they still carry; that is the whole point of removing them.
+    const student = await Student.findOne({ code, deletedAt: null })
       .select('studentId fullName nickname group code classId -_id')
       .lean();
 
@@ -1915,16 +2066,46 @@ async function resolvePrimaryStudent(student, depth = 0) {
   return resolvePrimaryStudent(parent, depth + 1);
 }
 
-// A deleted student's own play history is removed too, so the identity doesn't
+// A removed student's play history is hidden too, so the identity doesn't
 // linger as a name-only "light" entry in the roster — names are the identity
-// key, and leaving the sessions behind is why the row used to reappear.
-async function removeStudentPlaySessions(classId, student) {
+// key, and leaving the sessions visible is why the row used to reappear.
+//
+// This SOFT-deletes (`deletedAt`) rather than removing rows, so the whole
+// removal is reversible; the permanent-delete endpoint is what finally drops
+// them. Scoped by name within the class so an unrelated player who happens to
+// share a name is handled consistently with how the roster resolves identities.
+async function softDeleteStudentPlaySessions(classId, student, actorCode) {
   const names = [student?.nickname, student?.fullName]
     .map((n) => (n || '').toString().trim())
     .filter(Boolean);
-  if (names.length === 0) return;
-  await PlaySession.deleteMany({ classId, playerName: { $in: names } });
+  if (names.length === 0) return 0;
+  const result = await PlaySession.updateMany(
+    // `deletedAt: null` avoids re-stamping a row that an earlier removal
+    // already hid — otherwise that older undo would no longer restore it.
+    { classId, deletedAt: null, playerName: { $in: names } },
+    { $set: { deletedAt: new Date(), deletedBy: actorCode || null } }
+  );
+  return result.modifiedCount || 0;
 }
+
+async function restoreStudentPlaySessions(classId, student) {
+  const names = [student?.nickname, student?.fullName]
+    .map((n) => (n || '').toString().trim())
+    .filter(Boolean);
+  if (names.length === 0) return 0;
+  const result = await PlaySession.updateMany(
+    { classId, playerName: { $in: names }, deletedAt: { $ne: null } },
+    { $set: { deletedAt: null, deletedBy: null } }
+  );
+  return result.modifiedCount || 0;
+}
+
+// Every query that reports on players must ignore removed ones. Applied to
+// stats, summary, plays and the leaderboards so a removed student disappears
+// from every view at once and reappears identically when restored.
+// `deletedAt: null` also matches documents missing the field, so legacy rows
+// need no migration.
+const NOT_DELETED = { deletedAt: null };
 
 // The class-identity payload shared by every login mode.
 function classInfoPayload(classroom) {
@@ -2315,9 +2496,20 @@ app.post('/api/code-lookup', codeLookupLimiter, async (req, res) => {
     }
 
     // 4. Student code. Resolve any merge chain to the primary identity.
-    const student = await Student.findOne({ code: code.toUpperCase() }).lean();
+    // A soft-removed student is excluded (and, like a deactivated teacher, the
+    // code then matches nothing else because the namespace forbids a code
+    // living in two buckets), so removal revokes the login.
+    const student = await Student.findOne({
+      code: code.toUpperCase(),
+      deletedAt: null,
+    }).lean();
     if (student) {
       const primary = await resolvePrimaryStudent(student);
+      // resolvePrimaryStudent walks the merge chain, which could in principle
+      // land on a removed primary; the identity it would hand back must be live.
+      if (primary?.deletedAt) {
+        return res.status(401).json({ error: 'That code is no longer active' });
+      }
       const classInfo = await ClassInfo.findOne({ classId: primary.classId }).lean();
       return res.json({
         kind: 'studentCode',
@@ -2346,13 +2538,18 @@ app.post('/api/student-login', loginLimiter, async (req, res) => {
     const { studentCode, name: rawName, classCode } = req.body;
 
     if (studentCode) {
+      // Removed students cannot log in — see the GET variant above.
       const student = await Student.findOne({
         code: studentCode.toString().trim().toUpperCase(),
+        deletedAt: null,
       }).lean();
       if (!student) {
         return res.status(404).json({ error: 'Student code not found' });
       }
       const primary = await resolvePrimaryStudent(student);
+      if (primary?.deletedAt) {
+        return res.status(401).json({ error: 'That code is no longer active' });
+      }
       const classInfo = await ClassInfo.findOne({ classId: primary.classId }).lean();
       if (!classInfo) {
         return res.status(500).json({ error: 'Class not found for this student' });
@@ -2387,8 +2584,12 @@ app.post('/api/student-login', loginLimiter, async (req, res) => {
 
     // If a roster student already has this exact name, bind the light session
     // to that record so its history groups under one identity (no backfill).
+    // Only bind a light session to a LIVE roster student — binding it to a
+    // removed one would silently file the play history under an identity the
+    // teacher has already taken out of the roster.
     const existing = await Student.findOne({
       classId: classroom.classId,
+      deletedAt: null,
       $or: [{ nickname: name }, { fullName: name }],
     }).lean();
 
@@ -2607,7 +2808,7 @@ app.get('/api/stats', async (req, res) => {
   try {
     const teacher = await requireTeacher(req, res);
     if (!teacher) return;
-    const match = { classId: teacher.classId };
+    const match = { classId: teacher.classId, ...NOT_DELETED };
 
     // One round-trip: facet splits the matched set into the handful of
     // aggregates the panel needs without separate scans.
@@ -2704,7 +2905,7 @@ app.get('/api/summary', async (req, res) => {
       });
     }
 
-    const match = { classId };
+    const match = { classId, ...NOT_DELETED };
     if (!teacher) match.playerName = playerName;
 
     // Shared grouping — sorted by completedAt first so $last picks the most
@@ -2803,7 +3004,7 @@ app.get('/api/plays', async (req, res) => {
 
     const { limit, page, sortDir, sortKey, game, q } = parseListParams(req);
 
-    const match = { classId: teacher.classId };
+    const match = { classId: teacher.classId, ...NOT_DELETED };
     if (game) match.game = game;
     if (q) match.playerName = { $regex: escapeRegex(q), $options: 'i' };
 
@@ -2894,7 +3095,7 @@ app.get('/api/leaderboard', async (req, res) => {
     if (!since) since = weekStartFridayNoon(new Date());
 
     const rows = await PlaySession.aggregate([
-      { $match: { classId, completedAt: { $gte: since } } },
+      { $match: { classId, completedAt: { $gte: since }, ...NOT_DELETED } },
       {
         $group: {
           _id: '$playerName',
@@ -3013,7 +3214,7 @@ app.get('/api/weekly-mission', async (req, res) => {
     const since = parseWeekSince(req) || weekStartFridayNoon(new Date());
 
     const rows = await PlaySession.aggregate([
-      { $match: { classId: teacher.classId, completedAt: { $gte: since } } },
+      { $match: { classId: teacher.classId, completedAt: { $gte: since }, ...NOT_DELETED } },
       {
         $group: {
           _id: '$playerName',
@@ -3051,7 +3252,7 @@ app.get('/api/weekly-mission', async (req, res) => {
 // ---------------------------------------------------------------------------
 async function computeClassStats(classId) {
   const agg = await PlaySession.aggregate([
-    { $match: { classId } },
+    { $match: { classId, ...NOT_DELETED } },
     {
       $facet: {
         plays: [{ $count: 'n' }],

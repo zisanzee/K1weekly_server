@@ -45,6 +45,13 @@ const studentSchema = new mongoose.Schema({
   mergedAt: { type: Date, default: null },
   // Teacher code that performed the merge — audit only, no behaviour keyed off it.
   mergedBy: { type: String, default: null },
+  // Soft-delete marker. Removing a student sets this instead of deleting the
+  // row, so the removal is reversible and the code stays reserved. Queries use
+  // `deletedAt: null`, which in Mongo also matches documents missing the field
+  // entirely — so existing rows need no migration.
+  deletedAt: { type: Date, default: null, index: true },
+  // Teacher code that removed them — audit only, like mergedBy.
+  deletedBy: { type: String, default: null },
   createdAt: { type: Date, default: Date.now },
 });
 

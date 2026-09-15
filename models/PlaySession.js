@@ -21,6 +21,12 @@ const playSessionSchema = new mongoose.Schema({
   elapsedSeconds: { type: Number },
   mistakes: { type: Number, default: 0 },
   completedAt: { type: Date, default: Date.now },
+  // Soft-delete marker, set alongside the owning student's when a teacher
+  // removes them. Every stats/leaderboard/summary query filters
+  // `deletedAt: null`, so a removed student's history disappears immediately and
+  // returns intact if the removal is undone. `deletedAt: null` also matches
+  // documents without the field, so no migration is needed.
+  deletedAt: { type: Date, default: null },
   // Coarse device info captured client-side at the end of a play session —
   // handy for spotting "this game lags on X" patterns in the classroom.
   // Note: the inner classification field is called `kind`, not `type` —
