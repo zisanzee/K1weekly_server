@@ -3121,6 +3121,66 @@ app.get('/api/leaderboard', async (req, res) => {
   }
 });
 
+// Past weekly champions — the top few players for each COMPLETED week.
+//
+// There is no stored weekly state anywhere in this app: the live leaderboard
+// is derived from PlaySession by sliding `since` to the most recent Friday
+// noon, so a past week is reconstructed by the same group/count query over
+// that week's fixed [Fri noon, next Fri noon) window. Deriving on read (rather
+// than a Friday cron that snapshots a table) means a week's winners stay
+// correct after a session is deleted, and a server that slept through Friday
+// noon loses nothing.
+//
+// Teacher-scoped to the actor's own class, top 3 for each of the last 4
+// completed weeks, newest first — backs the stats panel's "Past winners" view.
+// NOTE: this route is registered ABOVE /api/leaderboard/:game so the literal
+// "/history" segment is matched before ":game" swallows it.
+const WINNERS_PER_WEEK = 3;
+const WINNERS_WEEKS = 4;
+app.get('/api/leaderboard/history', async (req, res) => {
+  try {
+    const teacher = await requireTeacher(req, res);
+    if (!teacher) return;
+
+    const since = parseWeekSince(req) || weekStartFridayNoon(new Date());
+    const startMs = since.getTime();
+    const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+    const weeks = [];
+
+    for (let i = 0; i < WINNERS_WEEKS; i += 1) {
+      const periodEnd = new Date(startMs - i * WEEK_MS); // exclusive
+      const periodStart = new Date(startMs - (i + 1) * WEEK_MS);
+      const rows = await PlaySession.aggregate([
+        {
+          $match: {
+            classId: teacher.classId,
+            completedAt: { $gte: periodStart, $lt: periodEnd },
+            ...NOT_DELETED,
+          },
+        },
+        { $group: { _id: '$playerName', trophies: { $sum: 1 } } },
+        { $sort: { trophies: -1, _id: 1 } },
+        { $limit: WINNERS_PER_WEEK },
+        { $project: { _id: 0, playerName: '$_id', trophies: 1 } },
+      ]);
+
+      // Skip a week that crowned nobody so the panel only lists real weeks.
+      if (rows.length > 0) {
+        weeks.push({
+          start: periodStart.toISOString(),
+          end: periodEnd.toISOString(),
+          winners: rows,
+        });
+      }
+    }
+
+    res.json({ weeks });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load past winners' });
+  }
+});
+
 // Top ten runs for one game.
 app.get('/api/leaderboard/:game', async (req, res) => {
   try {
