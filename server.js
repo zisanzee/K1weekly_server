@@ -18,6 +18,13 @@ const ClassInfo = require('./models/ClassInfo');
 const Student = require('./models/Student');
 const SystemConfig = require('./models/SystemConfig');
 const PlayerMerge = require('./models/PlayerMerge');
+const {
+  autoDetectMerges,
+  autoDetectMergesOrdered,
+  applyNameMerge,
+  resolveCanonicalName,
+  invalidateAutoMergeCache,
+} = require('./identity');
 const { lookupTeacher, getClasses, isKnownClass } = require('./directory');
 
 const app = express();
@@ -837,6 +844,10 @@ app.get('/api/classes/:classId/identities', async (req, res) => {
     const actor = await requireClassAccess(req, res, classId);
     if (!actor) return;
 
+    // Detect + persist similar-name merges before listing, so the roster shows
+    // the combined identities and the teacher can unmerge any of them.
+    await autoDetectMerges(classId, 'auto');
+
     const [students, names] = await Promise.all([
       Student.find({ classId, mergedInto: null, deletedAt: null })
         .select('studentId nickname fullName code -_id')
@@ -1177,6 +1188,8 @@ app.delete('/api/classes/:classId/identities/:name', async (req, res) => {
       if (merge.members.length === 0) merge.active = false;
       await merge.save();
     }
+    // Deleting an identity can unblock a merge the detector previously skipped.
+    for (const id of classIds) invalidateAutoMergeCache(id);
 
     // Soft: the name-only identity is hideable and restorable just like a
     // roster student, so an accidental tap on a child's name can be undone.
@@ -1280,51 +1293,9 @@ app.post('/api/classes/:classId/students/merge', async (req, res) => {
       });
     }
 
-    const now = new Date();
-
-    // Retag every session carrying a member name. Sessions already tagged by an
-    // earlier merge keep their original mergedFrom value.
-    for (const member of memberNames) {
-      await PlaySession.updateMany({ classId, playerName: member }, [
-        {
-          $set: {
-            playerName: primaryName,
-            mergedFrom: { $ifNull: ['$mergedFrom', '$playerName'] },
-          },
-        },
-      ]);
-    }
-
-    // Fold matching roster students into the primary roster record when one
-    // exists, so student-code logins also resolve to the primary.
-    const rosterByName = await Student.find({
-      classId,
-      $or: [{ nickname: { $in: memberNames } }, { fullName: { $in: memberNames } }],
-    }).lean();
-    const primaryRoster = await Student.findOne({
-      classId,
-      $or: [{ nickname: primaryName }, { fullName: primaryName }],
-    }).lean();
-
-    if (primaryRoster && rosterByName.length > 0) {
-      await Student.updateMany(
-        { _id: { $in: rosterByName.map((s) => s._id) } },
-        { $set: { mergedInto: primaryRoster._id, mergedAt: now, mergedBy: actor.name } }
-      );
-      await PlaySession.updateMany(
-        { classId, studentId: { $in: rosterByName.map((s) => s.studentId) } },
-        { $set: { studentId: primaryRoster.studentId } }
-      );
-    }
-
-    await PlayerMerge.create({
-      classId,
-      primaryName,
-      members: memberNames,
-      createdBy: actor.name,
-      createdAt: now,
-      active: true,
-    });
+    // Shared with the automatic detector so manual and automatic merges behave
+    // identically (same retag, same roster fold, same cache invalidation).
+    await applyNameMerge(classId, { primaryName, members: memberNames }, actor.name);
 
     res.json({ ok: true, primaryName, merged: memberNames });
   } catch (err) {
@@ -1400,6 +1371,9 @@ app.post('/api/classes/:classId/students/:studentId/unmerge', async (req, res) =
     merge.members = merge.members.filter((m) => m !== memberName);
     if (merge.members.length === 0) merge.active = false;
     await merge.save();
+
+    // The merge set changed — let the next read re-run auto-detection.
+    invalidateAutoMergeCache(classId);
 
     res.json({ ok: true, memberName, primaryName });
   } catch (err) {
@@ -2593,15 +2567,22 @@ app.post('/api/student-login', loginLimiter, async (req, res) => {
       $or: [{ nickname: name }, { fullName: name }],
     }).lean();
 
+    // Resolve the name to its merge primary so a light session for a
+    // merged-away variant ("Alyssa Tan") presents — and later logs — as the
+    // combined identity. Roster-bound sessions already carry the primary name.
+    const canonicalName = existing
+      ? existing.nickname || existing.fullName
+      : await resolveCanonicalName(classroom.classId, name);
+
     return res.json({
       identityKind: existing ? 'student-rostered' : 'student-light',
       student: existing
         ? {
             studentId: existing.studentId,
-            name: existing.nickname || existing.fullName,
+            name: canonicalName,
             code: existing.code,
           }
-        : { studentId: null, name, code: null },
+        : { studentId: null, name: canonicalName, code: null },
       classInfo: classInfoPayload(classroom),
     });
   } catch (err) {
@@ -2654,6 +2635,13 @@ app.post('/api/plays', playsLimiter, async (req, res) => {
           sessionPlayerName
         ).toString().slice(0, 40);
       }
+    } else {
+      // No roster id (public "light" login). Resolve the supplied name against
+      // the class's merge set so a variant/old name ("Alyssa Tan") lands in the
+      // combined "Alyssa" bucket instead of starting a fresh, split identity.
+      sessionPlayerName = (
+        await resolveCanonicalName(classId, sessionPlayerName)
+      ).toString().slice(0, 40);
     }
 
     const safeTotalRounds = Number(totalRounds) || 0;
@@ -2808,6 +2796,9 @@ app.get('/api/stats', async (req, res) => {
   try {
     const teacher = await requireTeacher(req, res);
     if (!teacher) return;
+    // Fold any similar-name identities together before aggregating, so the
+    // totals count them as one player.
+    await autoDetectMerges(teacher.classId, 'auto');
     const match = { classId: teacher.classId, ...NOT_DELETED };
 
     // One round-trip: facet splits the matched set into the handful of
@@ -2897,12 +2888,24 @@ app.get('/api/summary', async (req, res) => {
   try {
     const teacher = await teacherFromRequest(req);
     const classId = teacher?.classId || (await classIdFromRequest(req));
-    const playerName = (req.query.playerName || '').toString().trim();
+    let playerName = (req.query.playerName || '').toString().trim();
 
     if (!classId || (!teacher && !playerName)) {
       return res.status(400).json({
         error: 'Use a teacher code, or provide a valid classId and playerName',
       });
+    }
+
+    if (teacher) {
+      // Class-wide view — fold similar identities together first.
+      await autoDetectMerges(classId, 'auto');
+    } else {
+      // Single-player view: auto-detect around this name (longest-first so a
+      // fuller variant wins), then resolve the requested name to its primary so
+      // a child who signed in with a merged-away name still sees the combined
+      // stats and score.
+      await autoDetectMergesOrdered(classId, [playerName], 'auto');
+      playerName = (await resolveCanonicalName(classId, playerName)).toString();
     }
 
     const match = { classId, ...NOT_DELETED };
@@ -3002,6 +3005,8 @@ app.get('/api/plays', async (req, res) => {
     const teacher = await requireTeacher(req, res);
     if (!teacher) return;
 
+    await autoDetectMerges(teacher.classId, 'auto');
+
     const { limit, page, sortDir, sortKey, game, q } = parseListParams(req);
 
     const match = { classId: teacher.classId, ...NOT_DELETED };
@@ -3086,6 +3091,8 @@ app.get('/api/leaderboard', async (req, res) => {
     const classId = await requireClass(req, res);
     if (!classId) return;
 
+    await autoDetectMerges(classId, 'auto');
+
     let since;
     const sinceParam = (req.query.since || '').toString().trim();
     if (sinceParam) {
@@ -3142,6 +3149,8 @@ app.get('/api/leaderboard/history', async (req, res) => {
     const teacher = await requireTeacher(req, res);
     if (!teacher) return;
 
+    await autoDetectMerges(teacher.classId, 'auto');
+
     const since = parseWeekSince(req) || weekStartFridayNoon(new Date());
     const startMs = since.getTime();
     const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -3186,6 +3195,7 @@ app.get('/api/leaderboard/:game', async (req, res) => {
   try {
     const classId = await requireClass(req, res);
     if (!classId) return;
+    await autoDetectMerges(classId, 'auto');
     const top = await PlaySession.find({
       classId,
       game: req.params.game,
@@ -3235,10 +3245,15 @@ app.get('/api/player/weekly', async (req, res) => {
     const classId = await requireClass(req, res);
     if (!classId) return;
 
-    const playerName = (req.query.playerName || '').toString().trim();
+    let playerName = (req.query.playerName || '').toString().trim();
     if (!playerName) {
       return res.status(400).json({ error: 'playerName is required' });
     }
+
+    // Fold similar identities, then resolve this name to its primary so the
+    // child's weekly strip reflects the combined activity.
+    await autoDetectMergesOrdered(classId, [playerName], 'auto');
+    playerName = (await resolveCanonicalName(classId, playerName)).toString();
 
     const since = parseWeekSince(req) || weekStartFridayNoon(new Date());
 
@@ -3394,6 +3409,10 @@ app.get('/api/admin/stats/classes/:classId', async (req, res) => {
     if (!(await isKnownClass(classId))) {
       return res.status(404).json({ error: 'Class not found' });
     }
+    // Single-class view — fold similar identities so the unique-player count
+    // and per-game breakdown reflect the combined player. (Not done in the
+    // all-classes grid above, which would fan out over every class.)
+    await autoDetectMerges(classId, 'auto');
     res.json(await computeClassStats(classId));
   } catch (err) {
     console.error(err);
