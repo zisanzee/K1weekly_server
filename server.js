@@ -1382,6 +1382,265 @@ app.post('/api/classes/:classId/students/:studentId/unmerge', async (req, res) =
   }
 });
 
+// ---------------------------------------------------------------------------
+// Per-student detail stats — the teacher-only student data page.
+// ---------------------------------------------------------------------------
+// SECURITY IS THE WHOLE POINT OF THIS ROUTE, so it is layered:
+//
+//   1. requireClassAccess — admin may read any class, a teacher ONLY their own.
+//      This is the real boundary; everything else is defence in depth.
+//   2. The identity key is parsed strictly (400 when malformed).
+//   3. Every lookup is filtered by the PATH's classId as well as the identity.
+//      Without that, a teacher of class A could paste class B's studentId and
+//      read a stranger's history — the guard alone only proves which class they
+//      own, not that the child belongs to it.
+//   4. A miss returns 404, never 403: a 403 would confirm the id exists
+//      somewhere else, which is itself a leak.
+//
+// The `:studentKey` carries a prefix so the parse is unambiguous:
+//   s_<studentId>  rostered child
+//   n_<name>       "light" public-class child (no Student row), URI-encoded
+// Mirrors src/games/studentKey.js on the frontend; both must agree.
+const STUDENT_KEY_ROSTERED = 's_';
+const STUDENT_KEY_NAME = 'n_';
+
+// Turns a :studentKey into the exact set of PlaySession filters that represent
+// ONE child, or returns an error for the caller to send.
+//
+// Returns { filters, identity } where `filters` is a Mongo match fragment to be
+// spread into the query alongside classId, and `identity` is what the page shows
+// in its header.
+async function resolveStudentIdentity(classId, rawKey) {
+  const key = (rawKey || '').toString();
+  if (!key) return { error: 'A student is required', status: 400 };
+
+  if (key.startsWith(STUDENT_KEY_ROSTERED)) {
+    const studentId = key.slice(STUDENT_KEY_ROSTERED.length).trim();
+    if (!studentId) return { error: 'Invalid student key', status: 400 };
+
+    // classId is in the FILTER, not just the guard — see note 3 above.
+    const student = await Student.findOne({ classId, studentId, deletedAt: null })
+      .select('studentId fullName nickname group code mergedInto -_id')
+      .lean();
+    if (!student) return { error: 'Student not found in this class', status: 404 };
+
+    const name = (student.nickname || student.fullName || '').toString().trim();
+    if (!name) return { error: 'That student has no name to report on', status: 400 };
+
+    // A merged-away roster row is reported through its primary, so the page
+    // shows the COMBINED history rather than one fragment of it.
+    let primaryName = name;
+    if (student.mergedInto) {
+      const primary = await Student.findById(student.mergedInto)
+        .select('nickname fullName classId -_id')
+        .lean();
+      // Belt and braces: only follow a merge that stays inside this class.
+      if (primary && primary.classId === classId) {
+        primaryName = (primary.nickname || primary.fullName || name).toString().trim() || name;
+      }
+    }
+
+    // Sessions are matched by studentId (authoritative) OR by the resolved name
+    // (covers plays logged before the roster row existed, and any name-merge
+    // retags). $or with two indexed-ish branches still bounds to one class.
+    return {
+      filters: {
+        $or: [
+          { studentId },
+          { playerName: primaryName },
+        ],
+      },
+      identity: {
+        kind: 'rostered',
+        studentId,
+        name: primaryName,
+        group: student.group || '',
+        code: student.code || null,
+        mergedFrom: student.mergedInto ? name : null,
+      },
+    };
+  }
+
+  if (key.startsWith(STUDENT_KEY_NAME)) {
+    let name;
+    try {
+      name = decodeURIComponent(key.slice(STUDENT_KEY_NAME.length)).trim();
+    } catch {
+      return { error: 'Invalid student key', status: 400 };
+    }
+    if (!name) return { error: 'Invalid student key', status: 400 };
+    if (name === 'Guest') {
+      // "Guest" is the shared bucket for unnamed players — aggregating it would
+      // show a class-wide blur, not one child.
+      return { error: 'Guest plays are not attributable to a student', status: 400 };
+    }
+
+    // Fold this name to its merge primary, exactly like every other read path,
+    // so a light child whose name was merged shows the combined history.
+    const primaryName = (await resolveCanonicalName(classId, name)).toString().trim() || name;
+
+    return {
+      // A light identity has no studentId, so the name IS the identity. Match
+      // both the requested name and the primary, so a row that predates the
+      // merge is still counted.
+      filters: primaryName === name
+        ? { playerName: name }
+        : { playerName: { $in: [primaryName, name] } },
+      identity: {
+        kind: 'light',
+        studentId: null,
+        name: primaryName,
+        group: '',
+        code: null,
+        mergedFrom: primaryName === name ? null : name,
+      },
+    };
+  }
+
+  return { error: 'Invalid student key', status: 400 };
+}
+
+app.get('/api/classes/:classId/students/:studentKey/stats', async (req, res) => {
+  try {
+    const { classId, studentKey } = req.params;
+    const actor = await requireClassAccess(req, res, classId);
+    if (!actor) return;
+
+    const resolved = await resolveStudentIdentity(classId, studentKey);
+    if (resolved.error) {
+      return res.status(resolved.status).json({ error: resolved.error });
+    }
+
+    // The client's own local Friday-noon boundary wins, so a child in a
+    // different timezone sees THEIR weeks. Falls back to the server's.
+    const weekStart = parseWeekSince(req) || weekStartFridayNoon(new Date());
+    const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+    const WEEKS = 8;
+    // Oldest bucket first: start of the 8th week back.
+    const historyStart = new Date(weekStart.getTime() - (WEEKS - 1) * WEEK_MS);
+
+    const match = { classId, ...NOT_DELETED, ...resolved.filters };
+
+    // One round-trip: $facet computes every number the page needs off a single
+    // scan of this child's sessions. A child has tens of rows, so this is small;
+    // separate queries would just be more latency on a Render cold start.
+    const agg = await PlaySession.aggregate([
+      { $match: match },
+      {
+        $facet: {
+          // All-time totals.
+          totals: [
+            {
+              $group: {
+                _id: null,
+                plays: { $sum: 1 },
+                games: { $addToSet: '$game' },
+                lastPlayedAt: { $max: '$completedAt' },
+                firstPlayedAt: { $min: '$completedAt' },
+              },
+            },
+          ],
+          // This week only (Friday-noon boundary).
+          thisWeek: [
+            { $match: { completedAt: { $gte: weekStart } } },
+            {
+              $group: {
+                _id: null,
+                plays: { $sum: 1 },
+                games: { $addToSet: '$game' },
+              },
+            },
+          ],
+          // Per-game breakdown that drives favourite / strongest / hardest.
+          perGame: [
+            {
+              $group: {
+                _id: '$game',
+                plays: { $sum: 1 },
+                // $avg ignores docs missing the field, but `mistakes` has a
+                // schema default of 0, so early plays count as clean. Same
+                // caveat the class-wide stats endpoint documents.
+                avgMistakes: { $avg: '$mistakes' },
+                avgStreak: { $avg: '$peakStreak' },
+                bestStreak: { $max: '$peakStreak' },
+                totalMistakes: { $sum: '$mistakes' },
+                lastPlayedAt: { $max: '$completedAt' },
+              },
+            },
+            { $sort: { plays: -1, _id: 1 } },
+          ],
+          // 8 weekly buckets. $dateDiff against the history start, floored to
+          // whole weeks, gives the bucket index directly.
+          weekly: [
+            { $match: { completedAt: { $gte: historyStart } } },
+            {
+              $group: {
+                _id: {
+                  $floor: {
+                    $divide: [{ $subtract: ['$completedAt', historyStart] }, WEEK_MS],
+                  },
+                },
+                plays: { $sum: 1 },
+                games: { $addToSet: '$game' },
+              },
+            },
+          ],
+        },
+      },
+    ]);
+
+    const facet = agg[0] || {};
+    const totals = facet.totals?.[0] || { plays: 0, games: [], lastPlayedAt: null, firstPlayedAt: null };
+    const thisWeek = facet.thisWeek?.[0] || { plays: 0, games: [] };
+
+    // Fill every one of the 8 buckets, including empty weeks, so the chart has a
+    // continuous axis instead of collapsing gaps.
+    const byIndex = new Map((facet.weekly || []).map((w) => [w._id, w]));
+    const weeks = [];
+    for (let i = 0; i < WEEKS; i += 1) {
+      const start = new Date(historyStart.getTime() + i * WEEK_MS);
+      const bucket = byIndex.get(i);
+      weeks.push({
+        start: start.toISOString(),
+        end: new Date(start.getTime() + WEEK_MS).toISOString(),
+        plays: bucket?.plays ?? 0,
+        games: bucket?.games?.length ?? 0,
+        current: i === WEEKS - 1,
+      });
+    }
+
+    const perGame = (facet.perGame || []).map((g) => ({
+      game: g._id,
+      plays: g.plays,
+      avgMistakes: g.avgMistakes ?? 0,
+      avgStreak: g.avgStreak ?? 0,
+      bestStreak: g.bestStreak ?? 0,
+      totalMistakes: g.totalMistakes ?? 0,
+      lastPlayedAt: g.lastPlayedAt,
+    }));
+
+    res.json({
+      identity: resolved.identity,
+      weekStart: weekStart.toISOString(),
+      total: {
+        plays: totals.plays ?? 0,
+        games: totals.games?.length ?? 0,
+        lastPlayedAt: totals.lastPlayedAt ?? null,
+        firstPlayedAt: totals.firstPlayedAt ?? null,
+      },
+      thisWeek: {
+        plays: thisWeek.plays ?? 0,
+        games: thisWeek.games?.length ?? 0,
+      },
+      weeks,
+      perGame,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not load student stats' });
+  }
+});
+
 // Public — validates a student login code and returns the student's info
 // plus their class details so the frontend can auto-log them in.
 app.get('/api/student-login/:code', async (req, res) => {
